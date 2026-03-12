@@ -1,4 +1,4 @@
-﻿# fly.toml app configuration file for montbileautoservices
+# fly.toml app configuration file for montbileautoservices
 app = 'montbileautoservices'
 primary_region = 'ams'
 
