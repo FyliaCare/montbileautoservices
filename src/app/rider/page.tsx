@@ -740,7 +740,7 @@ export default function RiderDashboard() {
               onChange={(e) => setFareAmount(e.target.value)}
               className="w-full rounded-2xl border-2 border-gray-200 bg-gray-50 px-4 py-4 text-3xl font-black text-center text-gray-900 tabular
                 focus:border-bolt focus:ring-2 focus:ring-bolt/20 focus:outline-none focus:bg-white
-                dark:border-surface-600 dark:bg-surface-700 dark:text-white dark:focus:border-bolt"
+                dark:border-surface-600 dark:bg-surface-700 dark:text-white dark:focus:border-bolt dark:focus:bg-surface-700"
             />
           </div>
 
