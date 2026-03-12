@@ -67,6 +67,12 @@ function formatDuration(sec: number): string {
   return `${h}h${m > 0 ? m + "m" : ""}`;
 }
 
+/** Convert heading degrees to compass direction */
+function getCompassDir(deg: number): string {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return dirs[Math.round(((deg % 360) + 360) % 360 / 45) % 8];
+}
+
 // Inject custom styles once
 let stylesInjected = false;
 function injectLeafletStyles() {
@@ -289,7 +295,7 @@ export function RiderMap({ locations, className = "", height = "380px", selected
       // For trackers: use tracker_data.online (device state), not status (shift state)
       const isActive = isTracker ? !!trackerOnline : loc.status === "active";
       const stale = isStale(loc.timestamp);
-      const speed = speedKmh(loc.speed);
+      const speed = isTracker && loc.tracker_data?.speed_kmh != null ? Math.round(loc.tracker_data.speed_kmh) : speedKmh(loc.speed);
       const isMoving = speed > 2;
       const isSelected = id === selectedRiderId;
       const initial = escapeHtml(loc.rider_name?.charAt(0)?.toUpperCase() || "?");
@@ -814,10 +820,12 @@ export function RiderMap({ locations, className = "", height = "380px", selected
         const loc = focusedLoc;
         const dlIsTracker = loc.source === "tracker";
         const td = loc.tracker_data;
-        const dlSpeed = speedKmh(loc.speed);
+        // Use tracker_data.speed_kmh directly for trackers; convert loc.speed (m/s) for phone
+        const dlSpeed = dlIsTracker && td?.speed_kmh != null ? Math.round(td.speed_kmh) : speedKmh(loc.speed);
         const dlMoving = dlSpeed > 2;
-        const dlHeading = loc.heading != null && loc.heading > 0 ? Math.round(loc.heading) : 0;
-        const dlCompass = dlIsTracker && td?.heading_compass ? td.heading_compass : (dlHeading > 0 ? `${dlHeading}°` : "—");
+        // Use tracker_data heading if available, else loc.heading
+        const dlHeading = dlIsTracker && td?.heading_computed ? Math.round(td.heading_computed) : (loc.heading != null && loc.heading > 0 ? Math.round(loc.heading) : 0);
+        const dlCompass = dlIsTracker && td?.heading_compass && td.heading_compass !== "—" ? td.heading_compass : (dlHeading > 0 ? getCompassDir(dlHeading) : "—");
         const dlAccuracy = loc.accuracy != null ? Math.round(loc.accuracy) : null;
         const dlMileage = trailDistanceKm(td?.trail);
         const dlStale = isStale(loc.timestamp);
@@ -950,7 +958,7 @@ export function RiderLocationList({
         const trackerOnline = isTracker && loc.tracker_data?.online;
         const isActive = isTracker ? !!trackerOnline : loc.status === "active";
         const stale = isStale(loc.timestamp);
-        const speed = speedKmh(loc.speed);
+        const speed = isTracker && loc.tracker_data?.speed_kmh != null ? Math.round(loc.tracker_data.speed_kmh) : speedKmh(loc.speed);
         const isMoving = speed > 2;
         const isSelected = loc.id === selectedRiderId;
         const ago = timeAgoLabel(loc.timestamp);

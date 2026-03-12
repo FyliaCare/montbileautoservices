@@ -851,7 +851,8 @@ process.on("SIGINT", async () => {
 function startHealthServer() {
   const PORT = process.env.PORT || 8080;
   const server = http.createServer((req, res) => {
-    if (req.url === "/health" || req.url === "/") {
+    const pathname = (req.url || "/").split("?")[0];
+    if (pathname === "/health" || pathname === "/") {
       const uptime = formatDuration(Math.round((Date.now() - state.stats.startTime) / 1000));
       const devices = state.config ? getEnabledDevices(state.config) : [];
 
