@@ -817,7 +817,7 @@ process.on("SIGINT", async () => {
 // ─── Health Check Server (for cloud platforms) ──────────────────────
 
 function startHealthServer() {
-  const PORT = process.env.PORT || 10000;
+  const PORT = process.env.PORT || 8080;
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
       const uptime = formatDuration(Date.now() - state.stats.startTime);
