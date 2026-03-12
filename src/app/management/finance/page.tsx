@@ -69,13 +69,19 @@ export default function FinancePage() {
       ? Object.values(appTrips).filter(t => t.created_at?.startsWith(today)).reduce((s, t) => s + (t.fare_amount || 0), 0)
       : 0;
 
-    // Fuel cost from daily logs
-    const totalFuel = Object.values(dailyLogs).reduce((s, l) => s + (l.fuel_cost || 0), 0);
+    // Expenses — split running vs startup
+    // Running = expenses on days the rider worked (fuel, transport etc — paid from sales)
+    // Startup = expenses before operations began (tyres, gear etc — paid from capital)
+    const opDates = new Set(Object.values(dailyLogs).map(l => l.date));
+    let runningExpenses = 0;
+    let startupExpenses = 0;
+    Object.values(expenses).forEach(e => {
+      if (opDates.has(e.date)) runningExpenses += e.amount || 0;
+      else startupExpenses += e.amount || 0;
+    });
+    const totalExpenses = runningExpenses + startupExpenses;
 
-    // Expenses (fuel, maintenance, misc etc.)
-    const totalExpenses = Object.values(expenses).reduce((s, e) => s + (e.amount || 0), 0);
-
-    // Payments — separate capital from operational
+    // Payments — separate capital from operational (wages)
     let capitalInvested = 0;
     let operationalPaid = 0;
     Object.values(payments).forEach(p => {
@@ -96,17 +102,19 @@ export default function FinancePage() {
       .filter(r => r.status === "pending")
       .reduce((s, r) => s + (r.amount || 0), 0);
 
-    // CASH IN HAND = cash received from rider - cash paid out (wages, etc)
-    const cashInHand = confirmedRemitted - operationalPaid;
+    // CASH IN HAND = cash received from rider
+    // Wages, fuel, transport are already deducted from sales by the rider before remitting
+    const cashInHand = confirmedRemitted;
 
     // Days worked
     const daysWorked = Object.values(dailyLogs).length;
 
     return {
-      totalSales: totalSales + liveEarnings,
+      totalSales,
       liveEarnings,
-      totalFuel,
       totalExpenses,
+      runningExpenses,
+      startupExpenses,
       capitalInvested,
       operationalPaid,
       totalRemitted,
@@ -271,7 +279,8 @@ function DashboardTab({
   riderDailyPay,
 }: {
   numbers: {
-    totalSales: number; liveEarnings: number; totalFuel: number; totalExpenses: number;
+    totalSales: number; liveEarnings: number; totalExpenses: number;
+    runningExpenses: number; startupExpenses: number;
     capitalInvested: number; operationalPaid: number; totalRemitted: number;
     confirmedRemitted: number; pendingRemitted: number; cashInHand: number; daysWorked: number;
   };
@@ -294,7 +303,7 @@ function DashboardTab({
           <p className="text-4xl font-black text-white tabular">{c(numbers.cashInHand)}</p>
           <p className="mt-2 text-[11px] text-emerald-200/80 leading-relaxed">
             This is the money you should have right now.
-            <br/>Cash received ({c(numbers.confirmedRemitted)}) minus wages paid out ({c(numbers.operationalPaid)}).
+            <br/>Total cash received from rider. Fuel, transport &amp; wages are already deducted from sales before the rider hands you cash.
           </p>
           {numbers.pendingRemitted > 0 && (
             <div className="mt-3 flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2">
@@ -339,17 +348,17 @@ function DashboardTab({
             <p className="text-[11px] font-bold uppercase tracking-wide text-red-600 dark:text-red-400">Money Out</p>
           </div>
           <div>
-            <p className="text-xs text-gray-500">Fuel</p>
-            <p className="text-lg font-black text-red-600 dark:text-red-400 tabular">{c(numbers.totalFuel)}</p>
+            <p className="text-xs text-gray-500">Running Costs</p>
+            <p className="text-lg font-black text-red-600 dark:text-red-400 tabular">{c(numbers.runningExpenses + numbers.operationalPaid)}</p>
+            <p className="text-[9px] text-gray-400">fuel, transport, wages</p>
           </div>
-          <div>
-            <p className="text-xs text-gray-500">All Expenses</p>
-            <p className="text-sm font-bold text-gray-700 dark:text-gray-300 tabular">{c(numbers.totalExpenses)}</p>
-          </div>
-          <div>
-            <p className="text-xs text-gray-500">Wages Paid</p>
-            <p className="text-sm font-bold text-gray-700 dark:text-gray-300 tabular">{c(numbers.operationalPaid)}</p>
-          </div>
+          {numbers.startupExpenses > 0 && (
+            <div>
+              <p className="text-xs text-gray-500">Startup Costs</p>
+              <p className="text-sm font-bold text-gray-700 dark:text-gray-300 tabular">{c(numbers.startupExpenses)}</p>
+              <p className="text-[9px] text-gray-400">tyres, gear, initial fuel</p>
+            </div>
+          )}
         </div>
       </div>
 
@@ -471,36 +480,35 @@ function DayCard({ day, dailyTarget, riderDailyPay }: { day: DayBreakdown; daily
       {/* Expanded detail */}
       {open && (
         <div className="mt-3 pt-3 border-t border-gray-100 dark:border-surface-600 space-y-2 text-sm">
-          <DayRow emoji="\uD83D\uDCB0" label="Total Sales" amount={day.sales} color="text-emerald-600 dark:text-emerald-400" />
-          {day.fuel > 0 && <DayRow emoji="\u26FD" label="Fuel" amount={-day.fuel} color="text-red-500" />}
-          {day.exp > 0 && (
+          <DayRow emoji="💰" label="Total Sales" amount={day.sales} color="text-emerald-600 dark:text-emerald-400" />
+          {day.expenses.length > 0 && (
             <div>
-              <DayRow emoji="\uD83D\uDCE4" label="Other Expenses" amount={-day.exp} color="text-red-500" />
+              <DayRow emoji="📤" label="Expenses" amount={-day.exp} color="text-red-500" />
               {day.expenses.map((e, i) => (
                 <p key={i} className="text-[10px] text-gray-400 ml-8">
-                  {e.category}: {c(e.amount)} \u2014 {e.description}
+                  {e.category}: {c(e.amount)} — {e.description}
                 </p>
               ))}
             </div>
           )}
-          {day.wagePaid > 0 && <DayRow emoji="\uD83D\uDC64" label="Rider Wage Paid" amount={-day.wagePaid} color="text-orange-500" />}
+          {day.wagePaid > 0 && <DayRow emoji="👤" label="Rider Wage Paid" amount={-day.wagePaid} color="text-orange-500" />}
           <div className="border-t border-dashed border-gray-200 dark:border-surface-600 pt-2">
-            <DayRow emoji="\uD83C\uDFE6" label="Cash Brought to Office" amount={day.remitted} color="text-blue-600 dark:text-blue-400" bold />
+            <DayRow emoji="🏦" label="Cash Brought to Office" amount={day.remitted} color="text-blue-600 dark:text-blue-400" bold />
           </div>
 
           {/* Shortfall explanation */}
           {day.sales > 0 && day.remitted > 0 && day.remitted < day.sales && (
             <div className="rounded-lg bg-amber-50 dark:bg-amber-900/20 px-3 py-2 mt-1">
               <p className="text-[11px] text-amber-700 dark:text-amber-300 font-medium">
-                \uD83D\uDCA1 {c(day.sales - day.remitted)} was used from sales before bringing cash
-                {day.fuel > 0 ? ` (fuel ${c(day.fuel)})` : ""}
+                {"💡"} {c(day.sales - day.remitted)} deducted from sales
+                {day.exp > 0 ? ` (expenses ${c(day.exp)})` : ""}
                 {day.wagePaid > 0 ? ` + wage ${c(day.wagePaid)}` : ""}
               </p>
             </div>
           )}
 
           {day.notes && (
-            <p className="text-[10px] text-gray-400 italic ml-2 mt-1">\uD83D\uDCDD {day.notes}</p>
+            <p className="text-[10px] text-gray-400 italic ml-2 mt-1">{"📝"} {day.notes}</p>
           )}
         </div>
       )}
