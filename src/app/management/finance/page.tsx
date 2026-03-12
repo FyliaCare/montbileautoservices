@@ -3,25 +3,37 @@
 import React, { useState, useMemo } from "react";
 import { useFirebaseStore } from "@/stores/firebase-store";
 import { useShallow } from "zustand/react/shallow";
-import { Card, StatCard, SectionHeader } from "@/components/ui/card";
+import { Card, SectionHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { BottomSheet } from "@/components/ui/bottom-sheet";
 import { EmptyState } from "@/components/ui/loading";
-import { formatCurrency, formatDate, todayISO, uid } from "@/lib/utils";
+import { formatCurrency, formatDate, todayISO } from "@/lib/utils";
 import { EXPENSE_CATEGORIES, DEFAULTS } from "@/lib/constants";
 import type { DailyLog, Expense, Payment, Remittance } from "@/lib/types";
 import { toast } from "sonner";
 import {
-  Wallet, TrendingUp, TrendingDown, Navigation,
-  Plus, CreditCard, Receipt, ClipboardList, BarChart3,
-  Calendar, Banknote, ArrowDownRight, ArrowUpRight,
-  CheckCircle2, XCircle, Clock, FileText, Calculator
+  Wallet, TrendingDown,
+  Plus, CreditCard, Receipt,
+  Banknote, ArrowDownRight, ArrowUpRight,
+  CheckCircle2, XCircle, Clock,
+  ChevronDown, ChevronUp,
+  Eye, CircleDollarSign, PiggyBank, CalendarDays,
 } from "lucide-react";
-import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid } from "recharts";
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 
-type Tab = "overview" | "daily" | "expenses" | "payments" | "remittance" | "pnl";
+// ─── Helpers ───
+function c(n: number) { return formatCurrency(n); }
+function dateLabel(d: string) {
+  const today = todayISO();
+  const yest = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  if (d === today) return "Today";
+  if (d === yest) return "Yesterday";
+  return formatDate(d);
+}
+
+type Tab = "dashboard" | "days" | "expenses" | "payments" | "remittance";
 
 export default function FinancePage() {
   const {
@@ -39,63 +51,118 @@ export default function FinancePage() {
     editRemittance: s.editRemittance,
   })));
 
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>("dashboard");
   const [sheet, setSheet] = useState<"daily" | "expense" | "payment" | null>(null);
 
-  const totalRevenue = useMemo(() =>
-    Object.values(dailyLogs).reduce((s, l) => s + (l.total_revenue || 0), 0), [dailyLogs]);
-  const totalExpenses = useMemo(() =>
-    Object.values(expenses).reduce((s, e) => s + (e.amount || 0), 0), [expenses]);
+  const dailyTarget = settings?.remit_d || DEFAULTS.dailyTarget;
+  const riderDailyPay = settings?.wage || DEFAULTS.riderDailyPay;
 
-  // Include live trip earnings from active shifts (not yet in dailyLogs)
-  const liveEarnings = useMemo(() => {
-    const today = new Date().toISOString().slice(0, 10);
+  // ─── Core numbers ───
+  const numbers = useMemo(() => {
+    // Revenue from daily logs
+    const totalSales = Object.values(dailyLogs).reduce((s, l) => s + (l.total_revenue || 0), 0);
+
+    // Live today earnings from active shift
+    const today = todayISO();
     const hasActiveShift = Object.values(appShifts).some(s => s.status === "active");
-    if (!hasActiveShift) return 0;
-    return Object.values(appTrips)
-      .filter(t => t.created_at?.startsWith(today))
-      .reduce((s, t) => s + (t.fare_amount || 0), 0);
-  }, [appTrips, appShifts]);
-  const displayRevenue = totalRevenue + liveEarnings;
+    const liveEarnings = hasActiveShift
+      ? Object.values(appTrips).filter(t => t.created_at?.startsWith(today)).reduce((s, t) => s + (t.fare_amount || 0), 0)
+      : 0;
 
-  const profit = displayRevenue - totalExpenses;
+    // Fuel cost from daily logs
+    const totalFuel = Object.values(dailyLogs).reduce((s, l) => s + (l.fuel_cost || 0), 0);
 
-  // Separate capital investments from rider/operational payments
-  const { capitalInvested, riderPayments } = useMemo(() => {
-    let cap = 0;
-    let rider = 0;
-    Object.values(payments).forEach((p) => {
-      const ref = (p.reference || "").toLowerCase() + (p.notes || "").toLowerCase();
+    // Expenses (fuel, maintenance, misc etc.)
+    const totalExpenses = Object.values(expenses).reduce((s, e) => s + (e.amount || 0), 0);
+
+    // Payments — separate capital from operational
+    let capitalInvested = 0;
+    let operationalPaid = 0;
+    Object.values(payments).forEach(p => {
+      const ref = ((p.reference || "") + (p.notes || "")).toLowerCase();
       if (ref.includes("capital") || ref.includes("startup") || ref.includes("investment") || ref.includes("seed")) {
-        cap += p.amount || 0;
+        capitalInvested += p.amount || 0;
       } else {
-        rider += p.amount || 0;
+        operationalPaid += p.amount || 0;
       }
     });
-    return { capitalInvested: cap, riderPayments: rider };
-  }, [payments]);
-  const totalPayments = capitalInvested + riderPayments;
+
+    // Remittances — cash actually handed to management
+    const totalRemitted = Object.values(appRemittances).reduce((s, r) => s + (r.amount || 0), 0);
+    const confirmedRemitted = Object.values(appRemittances)
+      .filter(r => r.status === "confirmed")
+      .reduce((s, r) => s + (r.amount || 0), 0);
+    const pendingRemitted = Object.values(appRemittances)
+      .filter(r => r.status === "pending")
+      .reduce((s, r) => s + (r.amount || 0), 0);
+
+    // CASH IN HAND = cash received from rider - cash paid out (wages, etc)
+    const cashInHand = confirmedRemitted - operationalPaid;
+
+    // Days worked
+    const daysWorked = Object.values(dailyLogs).length;
+
+    return {
+      totalSales: totalSales + liveEarnings,
+      liveEarnings,
+      totalFuel,
+      totalExpenses,
+      capitalInvested,
+      operationalPaid,
+      totalRemitted,
+      confirmedRemitted,
+      pendingRemitted,
+      cashInHand,
+      daysWorked,
+    };
+  }, [dailyLogs, expenses, payments, appRemittances, appTrips, appShifts]);
+
+  // ─── Per-day breakdown ───
+  const dailyBreakdown = useMemo(() => {
+    const allDates = new Set<string>();
+    Object.values(dailyLogs).forEach(l => allDates.add(l.date));
+    Object.values(expenses).forEach(e => allDates.add(e.date));
+    Object.values(payments).forEach(p => allDates.add(p.date));
+    Object.values(appRemittances).forEach(r => allDates.add(r.remittance_date));
+
+    return Array.from(allDates).sort((a, b) => b.localeCompare(a)).map(date => {
+      const logs = Object.values(dailyLogs).filter(l => l.date === date);
+      const dayExp = Object.values(expenses).filter(e => e.date === date);
+      const dayPay = Object.values(payments).filter(p => p.date === date);
+      const dayRemit = Object.values(appRemittances).filter(r => r.remittance_date === date);
+
+      const sales = logs.reduce((s, l) => s + (l.total_revenue || 0), 0);
+      const fuel = logs.reduce((s, l) => s + (l.fuel_cost || 0), 0);
+      const trips = logs.reduce((s, l) => s + (l.trips || 0), 0);
+      const exp = dayExp.reduce((s, e) => s + (e.amount || 0), 0);
+      const wagePaid = dayPay.filter(p => {
+        const ref = ((p.reference || "") + (p.notes || "")).toLowerCase();
+        return !ref.includes("capital") && !ref.includes("startup") && !ref.includes("investment");
+      }).reduce((s, p) => s + (p.amount || 0), 0);
+      const remitted = dayRemit.reduce((s, r) => s + (r.amount || 0), 0);
+      const rider = logs[0]?.rider || "";
+      const notes = logs[0]?.notes || "";
+
+      return { date, sales, fuel, trips, exp, wagePaid, remitted, rider, notes, expenses: dayExp, payments: dayPay, remittances: dayRemit };
+    });
+  }, [dailyLogs, expenses, payments, appRemittances]);
+
+  // Expense breakdown for pie chart
+  const expenseBreakdown = useMemo(() => {
+    const byCategory: Record<string, number> = {};
+    Object.values(expenses).forEach(e => {
+      byCategory[e.category || "Other"] = (byCategory[e.category || "Other"] || 0) + e.amount;
+    });
+    return Object.entries(byCategory).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  }, [expenses]);
 
   const tabs: { key: Tab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-    { key: "overview", label: "Overview", icon: BarChart3 },
-    { key: "daily", label: "Daily", icon: ClipboardList },
+    { key: "dashboard", label: "Dashboard", icon: Eye },
+    { key: "days", label: "Daily", icon: CalendarDays },
     { key: "expenses", label: "Expenses", icon: Receipt },
     { key: "payments", label: "Payments", icon: CreditCard },
     { key: "remittance", label: "Remit", icon: Banknote },
-    { key: "pnl", label: "P&L", icon: FileText },
   ];
-
-  // Expense breakdown by category for pie chart
-  const expenseBreakdown = useMemo(() => {
-    const byCategory: Record<string, number> = {};
-    Object.values(expenses).forEach((e) => {
-      const cat = e.category || "Other";
-      byCategory[cat] = (byCategory[cat] || 0) + e.amount;
-    });
-    return Object.entries(byCategory)
-      .map(([name, value]) => ({ name, value }))
-      .sort((a, b) => b.value - a.value);
-  }, [expenses]);
 
   return (
     <div className="space-y-5 p-4 pb-28 animate-fade-in">
@@ -106,19 +173,19 @@ export default function FinancePage() {
         </div>
         <div>
           <h1 className="text-xl font-extrabold text-gray-900 dark:text-white">Finance</h1>
-          <p className="text-xs text-gray-500 dark:text-gray-400">Manage your money</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">See exactly where every cedi is</p>
         </div>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 rounded-2xl bg-gray-100 p-1 dark:bg-surface-700">
+      <div className="flex gap-1 rounded-2xl bg-gray-100 p-1 dark:bg-surface-700 overflow-x-auto">
         {tabs.map((t) => {
           const Icon = t.icon;
           return (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
-              className={`flex flex-1 items-center justify-center gap-1 rounded-xl py-2.5 text-[11px] font-bold transition-all ${
+              className={`flex flex-1 items-center justify-center gap-1 rounded-xl py-2.5 text-[11px] font-bold transition-all whitespace-nowrap ${
                 tab === t.key
                   ? "bg-white text-gray-900 shadow-sm dark:bg-surface-600 dark:text-white"
                   : "text-gray-500"
@@ -131,137 +198,196 @@ export default function FinancePage() {
         })}
       </div>
 
-      {/* Tab Content */}
-      {tab === "overview" && (
-        <OverviewTab
-          totalRevenue={displayRevenue}
-          totalExpenses={totalExpenses}
-          profit={profit}
-          capitalInvested={capitalInvested}
-          riderPayments={riderPayments}
+      {/* ══════════ DASHBOARD TAB ══════════ */}
+      {tab === "dashboard" && (
+        <DashboardTab
+          numbers={numbers}
+          dailyBreakdown={dailyBreakdown}
           expenseBreakdown={expenseBreakdown}
+          dailyTarget={dailyTarget}
+          riderDailyPay={riderDailyPay}
         />
       )}
 
-      {tab === "daily" && (
-        <DailyLogTab
-          dailyLogs={dailyLogs}
-          onAdd={() => setSheet("daily")}
+      {/* ══════════ DAILY TAB ══════════ */}
+      {tab === "days" && (
+        <DailyTab
+          breakdown={dailyBreakdown}
+          dailyTarget={dailyTarget}
+          riderDailyPay={riderDailyPay}
+          onAddLog={() => setSheet("daily")}
         />
       )}
 
+      {/* ══════════ EXPENSES TAB ══════════ */}
       {tab === "expenses" && (
-        <ExpensesTab
-          expenses={expenses}
-          onAdd={() => setSheet("expense")}
-        />
+        <ExpensesTab expenses={expenses} onAdd={() => setSheet("expense")} />
       )}
 
+      {/* ══════════ PAYMENTS TAB ══════════ */}
       {tab === "payments" && (
-        <PaymentsTab
-          payments={payments}
-          onAdd={() => setSheet("payment")}
-        />
+        <PaymentsTab payments={payments} onAdd={() => setSheet("payment")} />
       )}
 
+      {/* ══════════ REMITTANCE TAB ══════════ */}
       {tab === "remittance" && (
-        <RemittanceTab
-          remittances={appRemittances}
-          editRemittance={editRemittance}
-          settings={settings}
-        />
+        <RemittanceTab remittances={appRemittances} editRemittance={editRemittance} settings={settings} />
       )}
 
-      {tab === "pnl" && (
-        <PnLTab
-          dailyLogs={dailyLogs}
-          expenses={expenses}
-          payments={payments}
-          appRemittances={appRemittances}
-          settings={settings}
-          riders={riders}
-        />
-      )}
-
-      {/* Add Forms */}
-      {sheet === "daily" && (
-        <AddDailyLogSheet
-          riders={riders}
-          settings={settings}
-          onClose={() => setSheet(null)}
-        />
-      )}
-      {sheet === "expense" && (
-        <AddExpenseSheet onClose={() => setSheet(null)} />
-      )}
-      {sheet === "payment" && (
-        <AddPaymentSheet riders={riders} onClose={() => setSheet(null)} />
-      )}
+      {/* ══════════ ADD FORMS ══════════ */}
+      {sheet === "daily" && <AddDailyLogSheet riders={riders} settings={settings} onClose={() => setSheet(null)} />}
+      {sheet === "expense" && <AddExpenseSheet onClose={() => setSheet(null)} />}
+      {sheet === "payment" && <AddPaymentSheet riders={riders} onClose={() => setSheet(null)} />}
     </div>
   );
 }
 
-/* ─── Overview Tab ─── */
+/* ═══════════════════════════════════════════════════════════
+   DASHBOARD TAB — The #1 screen management needs
+   "Where is my money and how is the business doing?"
+   ═══════════════════════════════════════════════════════════ */
 const PIE_COLORS = ["#F5A623", "#34D399", "#3B82F6", "#EF4444", "#A855F7", "#EC4899", "#F97316", "#14B8A6"];
 
-function OverviewTab({
-  totalRevenue, totalExpenses, profit, capitalInvested, riderPayments, expenseBreakdown,
+interface DayBreakdown {
+  date: string;
+  sales: number;
+  fuel: number;
+  trips: number;
+  exp: number;
+  wagePaid: number;
+  remitted: number;
+  rider: string;
+  notes: string;
+  expenses: Expense[];
+  payments: Payment[];
+  remittances: Remittance[];
+}
+
+function DashboardTab({
+  numbers,
+  dailyBreakdown,
+  expenseBreakdown,
+  dailyTarget,
+  riderDailyPay,
 }: {
-  totalRevenue: number; totalExpenses: number; profit: number; capitalInvested: number; riderPayments: number;
+  numbers: {
+    totalSales: number; liveEarnings: number; totalFuel: number; totalExpenses: number;
+    capitalInvested: number; operationalPaid: number; totalRemitted: number;
+    confirmedRemitted: number; pendingRemitted: number; cashInHand: number; daysWorked: number;
+  };
+  dailyBreakdown: DayBreakdown[];
   expenseBreakdown: Array<{ name: string; value: number }>;
+  dailyTarget: number;
+  riderDailyPay: number;
 }) {
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* Hero profit card */}
-      <div className="relative overflow-hidden rounded-2xl bg-linear-to-br from-surface-700 to-surface-800 p-5">
-        <div className="absolute -right-6 -top-6 h-24 w-24 rounded-full bg-gold/10 blur-2xl" />
+
+      {/* ★ THE BIG ANSWER: How much cash should be in account/bag? */}
+      <div className="relative overflow-hidden rounded-2xl bg-linear-to-br from-emerald-600 to-emerald-800 p-5 shadow-lg">
+        <div className="absolute -right-6 -top-6 h-28 w-28 rounded-full bg-white/10 blur-2xl" />
         <div className="relative">
-          <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Operating Profit</p>
-          <p className={`mt-1 text-3xl font-black tabular ${profit >= 0 ? "text-bolt" : "text-danger"}`}>
-            {formatCurrency(profit)}
+          <div className="flex items-center gap-2 mb-1">
+            <PiggyBank className="h-5 w-5 text-emerald-200" />
+            <p className="text-xs font-bold uppercase tracking-wider text-emerald-200">Cash In Account</p>
+          </div>
+          <p className="text-4xl font-black text-white tabular">{c(numbers.cashInHand)}</p>
+          <p className="mt-2 text-[11px] text-emerald-200/80 leading-relaxed">
+            This is the money you should have right now.
+            <br/>Cash received ({c(numbers.confirmedRemitted)}) minus wages paid out ({c(numbers.operationalPaid)}).
           </p>
-          <div className="mt-2 flex items-center gap-1.5">
-            {profit >= 0 ? (
-              <ArrowUpRight className="h-4 w-4 text-bolt" />
-            ) : (
-              <ArrowDownRight className="h-4 w-4 text-danger" />
-            )}
-            <span className="text-xs font-medium text-gray-400">Revenue minus operational expenses</span>
+          {numbers.pendingRemitted > 0 && (
+            <div className="mt-3 flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2">
+              <Clock className="h-3.5 w-3.5 text-yellow-300" />
+              <p className="text-[11px] font-semibold text-yellow-200">
+                {c(numbers.pendingRemitted)} pending confirmation
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ★ Money Flow — IN vs OUT */}
+      <SectionHeader title="Money Flow" />
+      <div className="grid grid-cols-2 gap-3">
+        {/* Money IN */}
+        <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-4 space-y-3">
+          <div className="flex items-center gap-2">
+            <ArrowUpRight className="h-4 w-4 text-emerald-500" />
+            <p className="text-[11px] font-bold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">Money In</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-500">Total Sales</p>
+            <p className="text-lg font-black text-emerald-600 dark:text-emerald-400 tabular">{c(numbers.totalSales)}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-500">Cash Received</p>
+            <p className="text-sm font-bold text-gray-700 dark:text-gray-300 tabular">{c(numbers.confirmedRemitted)}</p>
+          </div>
+          {numbers.liveEarnings > 0 && (
+            <div>
+              <p className="text-xs text-gray-500">Live Today</p>
+              <p className="text-sm font-bold text-emerald-500 tabular animate-pulse">{c(numbers.liveEarnings)}</p>
+            </div>
+          )}
+        </div>
+
+        {/* Money OUT */}
+        <div className="rounded-2xl border border-red-500/20 bg-red-500/5 p-4 space-y-3">
+          <div className="flex items-center gap-2">
+            <ArrowDownRight className="h-4 w-4 text-red-500" />
+            <p className="text-[11px] font-bold uppercase tracking-wide text-red-600 dark:text-red-400">Money Out</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-500">Fuel</p>
+            <p className="text-lg font-black text-red-600 dark:text-red-400 tabular">{c(numbers.totalFuel)}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-500">All Expenses</p>
+            <p className="text-sm font-bold text-gray-700 dark:text-gray-300 tabular">{c(numbers.totalExpenses)}</p>
+          </div>
+          <div>
+            <p className="text-xs text-gray-500">Wages Paid</p>
+            <p className="text-sm font-bold text-gray-700 dark:text-gray-300 tabular">{c(numbers.operationalPaid)}</p>
           </div>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-3">
-        <StatCard label="Total Revenue" value={formatCurrency(totalRevenue)} color="gold" />
-        <StatCard label="Total Expenses" value={formatCurrency(totalExpenses)} color="danger" />
-      </div>
-      <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-3">
-        <StatCard label="Capital Invested" value={formatCurrency(capitalInvested)} sub="Seed funding" color="bolt" />
-        {riderPayments > 0 && (
-          <StatCard label="Rider Payments" value={formatCurrency(riderPayments)} sub="Wages & bonuses" color="forest" />
-        )}
+      {/* ★ Quick Stats */}
+      <div className="grid grid-cols-3 gap-2">
+        <div className="rounded-xl bg-gray-50 dark:bg-surface-700 p-3 text-center">
+          <p className="text-[10px] font-semibold text-gray-400 uppercase">Days</p>
+          <p className="text-xl font-black text-gray-900 dark:text-white">{numbers.daysWorked}</p>
+        </div>
+        <div className="rounded-xl bg-gray-50 dark:bg-surface-700 p-3 text-center">
+          <p className="text-[10px] font-semibold text-gray-400 uppercase">Avg/Day</p>
+          <p className="text-xl font-black text-gold tabular">
+            {numbers.daysWorked > 0 ? c(Math.round(numbers.totalSales / numbers.daysWorked)) : "\u2014"}
+          </p>
+        </div>
+        <div className="rounded-xl bg-gray-50 dark:bg-surface-700 p-3 text-center">
+          <p className="text-[10px] font-semibold text-gray-400 uppercase">Target</p>
+          <p className="text-xl font-black text-gray-900 dark:text-white">{c(dailyTarget)}</p>
+        </div>
       </div>
 
-      {/* Expense Breakdown Chart */}
+      {/* ★ Recent Days — at a glance */}
+      <SectionHeader title="Recent Days" />
+      {dailyBreakdown.slice(0, 5).map(day => (
+        <DayCard key={day.date} day={day} dailyTarget={dailyTarget} riderDailyPay={riderDailyPay} />
+      ))}
+
+      {/* ★ Where Money Goes (Expense Pie) */}
       {expenseBreakdown.length > 0 && (
         <>
-          <SectionHeader title="Expense Breakdown" />
+          <SectionHeader title="Where Money Goes" />
           <Card>
             <div className="flex items-center gap-4">
-              <div className="h-32 w-32 shrink-0">
+              <div className="h-28 w-28 shrink-0">
                 <ResponsiveContainer width="100%" height="100%">
                   <PieChart>
-                    <Pie
-                      data={expenseBreakdown}
-                      dataKey="value"
-                      nameKey="name"
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={28}
-                      outerRadius={55}
-                      paddingAngle={2}
-                      strokeWidth={0}
-                    >
+                    <Pie data={expenseBreakdown} dataKey="value" nameKey="name" cx="50%" cy="50%"
+                      innerRadius={24} outerRadius={50} paddingAngle={2} strokeWidth={0}>
                       {expenseBreakdown.map((_, i) => (
                         <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
                       ))}
@@ -271,7 +397,7 @@ function OverviewTab({
                         background: "#1F2937", border: "none", borderRadius: "12px",
                         fontSize: "11px", fontWeight: 700, color: "#fff", padding: "6px 10px",
                       }}
-                      formatter={(value) => [formatCurrency(Number(value)), ""]}
+                      formatter={(value) => [c(Number(value)), ""]}
                     />
                   </PieChart>
                 </ResponsiveContainer>
@@ -280,13 +406,10 @@ function OverviewTab({
                 {expenseBreakdown.slice(0, 5).map((item, i) => (
                   <div key={item.name} className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <div
-                        className="h-2.5 w-2.5 rounded-full"
-                        style={{ backgroundColor: PIE_COLORS[i % PIE_COLORS.length] }}
-                      />
-                      <span className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 truncate max-w-25">{item.name}</span>
+                      <div className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: PIE_COLORS[i % PIE_COLORS.length] }} />
+                      <span className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 truncate max-w-24">{item.name}</span>
                     </div>
-                    <span className="text-[11px] font-bold text-gray-700 dark:text-gray-300 tabular">{formatCurrency(item.value)}</span>
+                    <span className="text-[11px] font-bold text-gray-700 dark:text-gray-300 tabular">{c(item.value)}</span>
                   </div>
                 ))}
               </div>
@@ -294,53 +417,153 @@ function OverviewTab({
           </Card>
         </>
       )}
+
+      {/* ★ Capital Investment */}
+      {numbers.capitalInvested > 0 && (
+        <Card className="border border-blue-500/20 bg-blue-500/5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <CircleDollarSign className="h-5 w-5 text-blue-500" />
+              <div>
+                <p className="text-xs font-bold text-gray-700 dark:text-gray-300">Capital Invested</p>
+                <p className="text-[10px] text-gray-400">Startup & seed funding</p>
+              </div>
+            </div>
+            <p className="text-lg font-black text-blue-500 tabular">{c(numbers.capitalInvested)}</p>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }
 
-/* ─── Daily Log Tab ─── */
-function DailyLogTab({
-  dailyLogs,
-  onAdd,
-}: {
-  dailyLogs: Record<string, DailyLog>;
-  onAdd: () => void;
-}) {
-  const sorted = Object.entries(dailyLogs)
-    .map(([id, l]) => ({ ...l, id }))
-    .sort((a, b) => b.date.localeCompare(a.date));
+/* ─── Day Card — shows one day's story clearly ─── */
+function DayCard({ day, dailyTarget, riderDailyPay }: { day: DayBreakdown; dailyTarget: number; riderDailyPay: number }) {
+  const [open, setOpen] = useState(false);
+  const hitTarget = day.sales >= dailyTarget;
 
+  return (
+    <Card padding="sm" className="space-y-0">
+      <button onClick={() => setOpen(!open)} className="w-full text-left">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className={`flex h-10 w-10 items-center justify-center rounded-xl ${hitTarget ? "bg-emerald-500/10" : "bg-amber-500/10"}`}>
+              <CalendarDays className={`h-5 w-5 ${hitTarget ? "text-emerald-500" : "text-amber-500"}`} />
+            </div>
+            <div>
+              <p className="text-sm font-bold text-gray-900 dark:text-white">{dateLabel(day.date)}</p>
+              <p className="text-[11px] text-gray-500">
+                {day.trips > 0 && `${day.trips} trips \u2022 `}
+                {day.rider && <span className="text-gray-400">{day.rider.split(" ")[0]}</span>}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="text-right">
+              <p className="text-sm font-black text-emerald-600 dark:text-emerald-400 tabular">{c(day.sales)}</p>
+              <p className="text-[10px] text-gray-400">sales</p>
+            </div>
+            {open ? <ChevronUp className="h-4 w-4 text-gray-400" /> : <ChevronDown className="h-4 w-4 text-gray-400" />}
+          </div>
+        </div>
+      </button>
+
+      {/* Expanded detail */}
+      {open && (
+        <div className="mt-3 pt-3 border-t border-gray-100 dark:border-surface-600 space-y-2 text-sm">
+          <DayRow emoji="\uD83D\uDCB0" label="Total Sales" amount={day.sales} color="text-emerald-600 dark:text-emerald-400" />
+          {day.fuel > 0 && <DayRow emoji="\u26FD" label="Fuel" amount={-day.fuel} color="text-red-500" />}
+          {day.exp > 0 && (
+            <div>
+              <DayRow emoji="\uD83D\uDCE4" label="Other Expenses" amount={-day.exp} color="text-red-500" />
+              {day.expenses.map((e, i) => (
+                <p key={i} className="text-[10px] text-gray-400 ml-8">
+                  {e.category}: {c(e.amount)} \u2014 {e.description}
+                </p>
+              ))}
+            </div>
+          )}
+          {day.wagePaid > 0 && <DayRow emoji="\uD83D\uDC64" label="Rider Wage Paid" amount={-day.wagePaid} color="text-orange-500" />}
+          <div className="border-t border-dashed border-gray-200 dark:border-surface-600 pt-2">
+            <DayRow emoji="\uD83C\uDFE6" label="Cash Brought to Office" amount={day.remitted} color="text-blue-600 dark:text-blue-400" bold />
+          </div>
+
+          {/* Shortfall explanation */}
+          {day.sales > 0 && day.remitted > 0 && day.remitted < day.sales && (
+            <div className="rounded-lg bg-amber-50 dark:bg-amber-900/20 px-3 py-2 mt-1">
+              <p className="text-[11px] text-amber-700 dark:text-amber-300 font-medium">
+                \uD83D\uDCA1 {c(day.sales - day.remitted)} was used from sales before bringing cash
+                {day.fuel > 0 ? ` (fuel ${c(day.fuel)})` : ""}
+                {day.wagePaid > 0 ? ` + wage ${c(day.wagePaid)}` : ""}
+              </p>
+            </div>
+          )}
+
+          {day.notes && (
+            <p className="text-[10px] text-gray-400 italic ml-2 mt-1">\uD83D\uDCDD {day.notes}</p>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function DayRow({ emoji, label, amount, color, bold }: { emoji: string; label: string; amount: number; color: string; bold?: boolean }) {
+  return (
+    <div className={`flex items-center justify-between ${bold ? "font-bold" : ""}`}>
+      <div className="flex items-center gap-2">
+        <span className="text-sm">{emoji}</span>
+        <span className={`text-[12px] ${bold ? "text-gray-900 dark:text-white" : "text-gray-600 dark:text-gray-400"}`}>{label}</span>
+      </div>
+      <span className={`text-[12px] font-bold tabular ${color}`}>
+        {amount < 0 ? `\u2212${c(Math.abs(amount))}` : c(amount)}
+      </span>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   DAILY TAB — Expandable day-by-day view
+   ═══════════════════════════════════════════════════════════ */
+function DailyTab({
+  breakdown,
+  dailyTarget,
+  riderDailyPay,
+  onAddLog,
+}: {
+  breakdown: DayBreakdown[];
+  dailyTarget: number;
+  riderDailyPay: number;
+  onAddLog: () => void;
+}) {
   return (
     <div className="space-y-3 animate-fade-in">
       <div className="flex items-center justify-between">
-        <SectionHeader title={`Daily Logs (${sorted.length})`} />
-        <Button size="sm" variant="bolt" onClick={onAdd}>
+        <SectionHeader title={`Day by Day (${breakdown.length})`} />
+        <Button size="sm" variant="bolt" onClick={onAddLog}>
           <Plus className="mr-1 h-3.5 w-3.5" /> Add Log
         </Button>
       </div>
-      {sorted.length === 0 ? (
-        <EmptyState title="No daily logs" message="Add your first daily log" />
+
+      {/* Running total */}
+      {breakdown.length > 0 && (
+        <Card className="bg-linear-to-r from-emerald-500/10 to-transparent">
+          <div className="flex items-center justify-between">
+            <p className="text-xs font-bold text-gray-500">Running Total (all days)</p>
+            <p className="text-lg font-black text-emerald-600 dark:text-emerald-400 tabular">
+              {c(breakdown.reduce((s, d) => s + d.sales, 0))}
+            </p>
+          </div>
+        </Card>
+      )}
+
+      {breakdown.length === 0 ? (
+        <EmptyState title="No days recorded" message="Add your first daily log" />
       ) : (
-        <div className="space-y-2">
-          {sorted.map((log) => (
-            <Card key={log.id} padding="sm" className="flex items-center justify-between tap-active">
-              <div className="flex items-center gap-3 min-w-0 flex-1">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gold/10">
-                  <Navigation className="h-4 w-4 text-gold" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-bold text-gray-900 dark:text-white">{log.rider}</p>
-                  <p className="text-[11px] text-gray-500">
-                    {formatDate(log.date)} • {log.trips} trips • Fuel: {formatCurrency(log.fuel_cost || 0)}
-                  </p>
-                </div>
-              </div>
-              <div className="text-right">
-                <p className="text-sm font-black text-gold tabular">{formatCurrency(log.total_revenue)}</p>
-              </div>
-            </Card>
-          ))}
-        </div>
+        breakdown.map(day => (
+          <DayCard key={day.date} day={day} dailyTarget={dailyTarget} riderDailyPay={riderDailyPay} />
+        ))
       )}
     </div>
   );
@@ -377,7 +600,7 @@ function ExpensesTab({
             </div>
             <div>
               <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Total Spent</p>
-              <p className="text-xl font-black text-danger tabular">{formatCurrency(totalExp)}</p>
+              <p className="text-xl font-black text-danger tabular">{c(totalExp)}</p>
             </div>
           </div>
         </div>
@@ -396,11 +619,11 @@ function ExpensesTab({
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-bold text-gray-900 dark:text-white">{exp.description}</p>
                   <p className="text-[11px] text-gray-500">
-                    {formatDate(exp.date)} • <Badge variant="gray">{exp.category}</Badge>
+                    {dateLabel(exp.date)} • <Badge variant="gray">{exp.category}</Badge>
                   </p>
                 </div>
               </div>
-              <p className="text-sm font-black text-danger tabular">{formatCurrency(exp.amount)}</p>
+              <p className="text-sm font-black text-danger tabular">{c(exp.amount)}</p>
             </Card>
           ))}
         </div>
@@ -440,7 +663,7 @@ function PaymentsTab({
             </div>
             <div>
               <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Total Paid</p>
-              <p className="text-xl font-black text-bolt tabular">{formatCurrency(totalPay)}</p>
+              <p className="text-xl font-black text-bolt tabular">{c(totalPay)}</p>
             </div>
           </div>
         </div>
@@ -459,12 +682,12 @@ function PaymentsTab({
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-bold text-gray-900 dark:text-white">{pay.reference || "Payment"}</p>
                   <p className="text-[11px] text-gray-500">
-                    {formatDate(pay.date)} • {pay.method}
+                    {dateLabel(pay.date)} • {pay.method}
                     {pay.notes && ` • ${pay.notes}`}
                   </p>
                 </div>
               </div>
-              <p className="text-sm font-black text-bolt tabular">{formatCurrency(pay.amount)}</p>
+              <p className="text-sm font-black text-bolt tabular">{c(pay.amount)}</p>
             </Card>
           ))}
         </div>
@@ -791,7 +1014,7 @@ function AddPaymentSheet({
   );
 }
 
-/* ─── Remittance Tab ─── */
+/* ─── Remittance Tab — "Cash the rider brought back" ─── */
 function RemittanceTab({
   remittances,
   editRemittance,
@@ -805,15 +1028,13 @@ function RemittanceTab({
     .map(([id, r]) => ({ ...r, id }))
     .sort((a, b) => b.created_at.localeCompare(a.created_at));
 
-  const totalRemitted = sorted.reduce((s, r) => s + r.amount, 0);
   const confirmed = sorted.filter((r) => r.status === "confirmed");
   const pending = sorted.filter((r) => r.status === "pending");
-  const disputed = sorted.filter((r) => r.status === "disputed");
 
   const handleConfirm = async (id: string) => {
     try {
       await editRemittance(id, { status: "confirmed", confirmed_at: new Date().toISOString(), confirmed_by: "management" });
-      toast.success("Remittance confirmed");
+      toast.success("Confirmed \u2714");
     } catch {
       toast.error("Failed to confirm");
     }
@@ -822,292 +1043,106 @@ function RemittanceTab({
   const handleDispute = async (id: string) => {
     try {
       await editRemittance(id, { status: "disputed" });
-      toast.error("Remittance disputed");
+      toast.error("Disputed");
     } catch {
-      toast.error("Failed to dispute");
+      toast.error("Failed");
     }
-  };
-
-  const statusColor = (status: string) => {
-    if (status === "confirmed") return "green" as const;
-    if (status === "disputed") return "red" as const;
-    return "gold" as const;
-  };
-
-  const statusIcon = (status: string) => {
-    if (status === "confirmed") return <CheckCircle2 className="h-4 w-4 text-bolt" />;
-    if (status === "disputed") return <XCircle className="h-4 w-4 text-danger" />;
-    return <Clock className="h-4 w-4 text-gold" />;
   };
 
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* Summary */}
-      <div className="grid grid-cols-3 gap-3">
-        <StatCard label="Confirmed" value={`₵${Math.round(confirmed.reduce((s, r) => s + r.amount, 0))}`} color="bolt" />
-        <StatCard label="Pending" value={`${pending.length}`} color="gold" />
-        <StatCard label="Disputed" value={`${disputed.length}`} color="danger" />
+      {/* Explanation */}
+      <div className="rounded-xl bg-blue-50 dark:bg-blue-900/20 p-3">
+        <p className="text-[11px] text-blue-700 dark:text-blue-300 leading-relaxed">
+          <strong>Remittance</strong> = the cash the rider hands to you at the end of the day.
+          This is your actual money received. Sales minus what was spent on fuel/wages during the day.
+        </p>
       </div>
 
-      {/* Total remitted */}
-      <Card>
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Banknote className="h-5 w-5 text-gold" />
-            <p className="text-sm font-bold text-gray-700 dark:text-gray-300">Total Remitted</p>
-          </div>
-          <p className="text-lg font-black text-bolt tabular">{formatCurrency(totalRemitted)}</p>
+      {/* Summary boxes */}
+      <div className="grid grid-cols-2 gap-3">
+        <div className="rounded-xl bg-emerald-500/10 border border-emerald-500/20 p-4 text-center">
+          <p className="text-[10px] font-bold uppercase text-emerald-600 dark:text-emerald-400">Confirmed</p>
+          <p className="text-xl font-black text-emerald-600 dark:text-emerald-400 tabular mt-1">
+            {c(confirmed.reduce((s, r) => s + r.amount, 0))}
+          </p>
+          <p className="text-[10px] text-gray-400 mt-0.5">{confirmed.length} remittance{confirmed.length !== 1 ? "s" : ""}</p>
         </div>
-      </Card>
+        <div className="rounded-xl bg-amber-500/10 border border-amber-500/20 p-4 text-center">
+          <p className="text-[10px] font-bold uppercase text-amber-600 dark:text-amber-400">Pending</p>
+          <p className="text-xl font-black text-amber-600 dark:text-amber-400 tabular mt-1">
+            {c(pending.reduce((s, r) => s + r.amount, 0))}
+          </p>
+          <p className="text-[10px] text-gray-400 mt-0.5">{pending.length} waiting</p>
+        </div>
+      </div>
 
-      {/* Remittance list */}
-      {sorted.length === 0 ? (
-        <EmptyState title="No remittances" message="Rider remittances will appear here" />
-      ) : (
-        <div className="space-y-2">
-          {sorted.map((r) => (
-            <Card key={r.id} padding="sm">
+      {/* Pending first (needs action) */}
+      {pending.length > 0 && (
+        <>
+          <SectionHeader title="Needs Your Action" />
+          {pending.map((r) => (
+            <Card key={r.id} padding="sm" className="border-l-4 border-l-amber-500">
               <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-3">
-                  {statusIcon(r.status)}
-                  <div>
-                    <p className="text-sm font-bold text-gray-900 dark:text-white">{r.rider_name || r.rider_id}</p>
-                    <p className="text-[11px] text-gray-500">
-                      {formatDate(r.remittance_date)} • {r.payment_method}
-                    </p>
-                    {r.expected_amount && (
-                      <p className="text-[10px] text-gray-400">
-                        Expected: {formatCurrency(r.expected_amount)}
-                        {r.amount < r.expected_amount && (
-                          <span className="text-danger ml-1">({formatCurrency(r.amount - r.expected_amount)})</span>
-                        )}
-                      </p>
-                    )}
+                <div>
+                  <p className="text-sm font-bold text-gray-900 dark:text-white">
+                    {r.rider_name || r.rider_id}
+                  </p>
+                  <p className="text-[11px] text-gray-500">{dateLabel(r.remittance_date)} \u2022 {r.payment_method}</p>
+                  <div className="mt-1 flex items-center gap-3 text-[11px]">
+                    <span className="text-gray-400">
+                      Says he made: <strong className="text-gray-600 dark:text-gray-300">{c(r.expected_amount || 0)}</strong>
+                    </span>
+                    <span className="text-gray-400">
+                      Bringing: <strong className="text-emerald-600 dark:text-emerald-400">{c(r.amount)}</strong>
+                    </span>
                   </div>
+                  {r.expected_amount && r.amount < r.expected_amount && (
+                    <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">
+                      \u26A0 {c(r.expected_amount - r.amount)} difference (spent on fuel/expenses from sales)
+                    </p>
+                  )}
                 </div>
-                <div className="flex flex-col items-end gap-1.5">
-                  <p className="text-sm font-black text-gray-900 dark:text-white tabular">{formatCurrency(r.amount)}</p>
-                  <Badge variant={statusColor(r.status)}>
-                    {r.status}
-                  </Badge>
-                </div>
+                <p className="text-lg font-black text-gray-900 dark:text-white tabular">{c(r.amount)}</p>
               </div>
-              {r.status === "pending" && (
-                <div className="mt-3 flex gap-2">
-                  <Button
-                    variant="bolt"
-                    size="sm"
-                    onClick={() => handleConfirm(r.id)}
-                    icon={<CheckCircle2 className="h-3.5 w-3.5" />}
-                  >
-                    Confirm
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => handleDispute(r.id)}
-                    icon={<XCircle className="h-3.5 w-3.5" />}
-                  >
-                    Dispute
-                  </Button>
-                </div>
-              )}
+              <div className="mt-3 flex gap-2">
+                <Button variant="bolt" size="sm" onClick={() => handleConfirm(r.id)}
+                  icon={<CheckCircle2 className="h-3.5 w-3.5" />}>
+                  Yes, Received
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => handleDispute(r.id)}
+                  icon={<XCircle className="h-3.5 w-3.5" />}>
+                  Dispute
+                </Button>
+              </div>
             </Card>
           ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ─── P&L Tab ─── */
-function PnLTab({
-  dailyLogs, expenses, payments, appRemittances, settings, riders,
-}: {
-  dailyLogs: Record<string, DailyLog>;
-  expenses: Record<string, Expense>;
-  payments: Record<string, Payment>;
-  appRemittances: Record<string, Remittance>;
-  settings: import("@/lib/types").Settings | null;
-  riders: Record<string, import("@/lib/types").Rider>;
-}) {
-  const [period, setPeriod] = useState<"week" | "month" | "all">("month");
-
-  const dailyTarget = settings?.remit_d || DEFAULTS.dailyTarget;
-  const wdays = settings?.wdays || 26;
-
-  const pnlData = useMemo(() => {
-    const now = new Date();
-    let startDate = "";
-    if (period === "week") {
-      const d = new Date(now);
-      d.setDate(d.getDate() - 7);
-      startDate = d.toISOString().slice(0, 10);
-    } else if (period === "month") {
-      const d = new Date(now);
-      d.setMonth(d.getMonth() - 1);
-      startDate = d.toISOString().slice(0, 10);
-    }
-
-    const filteredLogs = Object.values(dailyLogs).filter(l => !startDate || l.date >= startDate);
-    const filteredExp = Object.values(expenses).filter(e => !startDate || e.date >= startDate);
-    const filteredRemit = Object.values(appRemittances).filter(r => !startDate || r.created_at.slice(0, 10) >= startDate);
-
-    const totalRevenue = filteredLogs.reduce((s, l) => s + (l.total_revenue || 0), 0);
-    const totalFuel = filteredLogs.reduce((s, l) => s + (l.fuel_cost || 0), 0);
-    const totalTrips = filteredLogs.reduce((s, l) => s + (l.trips || 0), 0);
-    // Rider pay is a flat daily rate (GH₵50/day), NOT a percentage
-    const riderDailyPay = settings?.rider_daily_pay || settings?.wage || DEFAULTS.riderDailyPay;
-    const daysLogged = filteredLogs.length;
-    const totalWage = riderDailyPay * daysLogged;
-    const totalExpenses = filteredExp.reduce((s, e) => s + (e.amount || 0), 0);
-    const totalRemittances = filteredRemit.reduce((s, r) => s + (r.amount || 0), 0);
-
-    const grossProfit = totalRevenue - totalFuel;
-    const operatingExpenses = totalExpenses + totalWage;
-    const netProfit = grossProfit - operatingExpenses;
-    const margin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
-
-    return {
-      totalRevenue, totalFuel, totalTrips, totalWage, totalExpenses,
-      totalRemittances, grossProfit, operatingExpenses, netProfit, margin,
-      daysLogged, riderDailyPay,
-    };
-  }, [dailyLogs, expenses, appRemittances, settings, period]);
-
-  // Monthly forecast
-  const forecast = useMemo(() => {
-    const dailyAvgRevenue = pnlData.daysLogged > 0 ? pnlData.totalRevenue / pnlData.daysLogged : 0;
-    const dailyAvgExpense = pnlData.daysLogged > 0 ? (pnlData.totalExpenses + pnlData.totalFuel + pnlData.totalWage) / pnlData.daysLogged : 0;
-    const projectedMonthlyRevenue = dailyAvgRevenue * wdays;
-    const projectedMonthlyExpense = dailyAvgExpense * wdays;
-    const projectedProfit = projectedMonthlyRevenue - projectedMonthlyExpense;
-    const breakEvenTripsPerDay = pnlData.totalTrips > 0 && pnlData.daysLogged > 0
-      ? Math.ceil(dailyAvgExpense / (pnlData.totalRevenue / pnlData.totalTrips))
-      : 0;
-    return { projectedMonthlyRevenue, projectedMonthlyExpense, projectedProfit, breakEvenTripsPerDay };
-  }, [pnlData, wdays]);
-
-  // Revenue by week chart data
-  const weeklyChart = useMemo(() => {
-    const weeks: Record<string, number> = {};
-    Object.values(dailyLogs).forEach(l => {
-      const d = new Date(l.date);
-      const weekStart = new Date(d);
-      weekStart.setDate(d.getDate() - d.getDay());
-      const key = weekStart.toISOString().slice(5, 10);
-      weeks[key] = (weeks[key] || 0) + (l.total_revenue || 0);
-    });
-    return Object.entries(weeks)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .slice(-8)
-      .map(([week, revenue]) => ({ week, revenue }));
-  }, [dailyLogs]);
-
-  const pnlRows: { label: string; amount: number; bold?: boolean; color?: string; indent?: boolean }[] = [
-    { label: "Revenue", amount: pnlData.totalRevenue, bold: true, color: "text-bolt" },
-    { label: "Fuel Cost", amount: -pnlData.totalFuel, indent: true },
-    { label: "Gross Profit", amount: pnlData.grossProfit, bold: true, color: pnlData.grossProfit >= 0 ? "text-bolt" : "text-danger" },
-    { label: `Rider Wages (₵${pnlData.riderDailyPay}/day × ${pnlData.daysLogged}d)`, amount: -pnlData.totalWage, indent: true },
-    { label: "Operating Expenses", amount: -pnlData.totalExpenses, indent: true },
-    { label: "Net Profit/(Loss)", amount: pnlData.netProfit, bold: true, color: pnlData.netProfit >= 0 ? "text-bolt" : "text-danger" },
-  ];
-
-  return (
-    <div className="space-y-4 animate-fade-in">
-      {/* Period selector */}
-      <div className="flex gap-2">
-        {(["week", "month", "all"] as const).map(p => (
-          <button key={p} onClick={() => setPeriod(p)}
-            className={`rounded-xl px-4 py-2 text-xs font-bold transition-all ${
-              period === p ? "bg-gold text-white shadow-md" : "bg-gray-100 text-gray-500 dark:bg-surface-700 dark:text-gray-400"
-            }`}>
-            {p === "week" ? "7 Days" : p === "month" ? "30 Days" : "All Time"}
-          </button>
-        ))}
-      </div>
-
-      {/* P&L Statement */}
-      <SectionHeader title="Profit & Loss Statement" />
-      <Card>
-        <div className="divide-y divide-gray-100 dark:divide-surface-600">
-          {pnlRows.map(row => (
-            <div key={row.label} className={`flex items-center justify-between py-2.5 ${row.indent ? "pl-4" : ""}`}>
-              <span className={`text-sm ${row.bold ? "font-bold text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400"}`}>
-                {row.label}
-              </span>
-              <span className={`text-sm font-bold tabular ${row.color || (row.indent ? "text-gray-500" : "")}`}>
-                {formatCurrency(Math.abs(row.amount))}
-                {row.amount < 0 && !row.bold && <span className="text-[10px] text-gray-400 ml-0.5">DR</span>}
-              </span>
-            </div>
-          ))}
-        </div>
-        <div className="mt-3 pt-3 border-t border-gray-100 dark:border-surface-600 flex items-center justify-between">
-          <span className="text-xs text-gray-400">Profit Margin</span>
-          <span className={`text-sm font-black tabular ${pnlData.margin >= 0 ? "text-bolt" : "text-danger"}`}>
-            {pnlData.margin.toFixed(1)}%
-          </span>
-        </div>
-      </Card>
-
-      {/* Key Metrics */}
-      <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-3">
-        <StatCard label="Days Logged" value={pnlData.daysLogged} color="default" />
-        <StatCard label="Total Trips" value={pnlData.totalTrips} color="bolt" />
-        <StatCard label="Remittances" value={formatCurrency(pnlData.totalRemittances)} color="gold" />
-        <StatCard label="Break-even/day" value={`${forecast.breakEvenTripsPerDay} trips`} color="default" />
-      </div>
-
-      {/* Forecast */}
-      <SectionHeader title="Monthly Forecast" />
-      <Card className="bg-linear-to-br from-gold/5 to-bolt/5">
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-gray-500">Projected Revenue</span>
-            <span className="text-sm font-bold text-bolt tabular">{formatCurrency(forecast.projectedMonthlyRevenue)}</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-gray-500">Projected Expenses</span>
-            <span className="text-sm font-bold text-danger tabular">{formatCurrency(forecast.projectedMonthlyExpense)}</span>
-          </div>
-          <div className="border-t border-gray-200 dark:border-surface-600 pt-2 flex items-center justify-between">
-            <span className="text-sm font-bold text-gray-900 dark:text-white">Projected Profit</span>
-            <span className={`text-lg font-black tabular ${forecast.projectedProfit >= 0 ? "text-bolt" : "text-danger"}`}>
-              {formatCurrency(forecast.projectedProfit)}
-            </span>
-          </div>
-          <p className="text-[10px] text-gray-400">
-            Based on {pnlData.daysLogged} days of data • {wdays} working days/month
-          </p>
-        </div>
-      </Card>
-
-      {/* Revenue Trend Chart */}
-      {weeklyChart.length > 1 && (
-        <>
-          <SectionHeader title="Revenue Trend" />
-          <Card>
-            <div className="h-40">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={weeklyChart}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" opacity={0.2} />
-                  <XAxis dataKey="week" tick={{ fontSize: 10, fill: "#9CA3AF" }} />
-                  <YAxis tick={{ fontSize: 10, fill: "#9CA3AF" }} width={45}
-                    tickFormatter={(v) => `₵${v}`} />
-                  <Tooltip
-                    contentStyle={{
-                      background: "#1F2937", border: "none", borderRadius: "12px",
-                      fontSize: "11px", fontWeight: 700, color: "#fff", padding: "6px 10px",
-                    }}
-                    formatter={(value) => [formatCurrency(Number(value)), "Revenue"]}
-                  />
-                  <Bar dataKey="revenue" fill="#34D399" radius={[6, 6, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </Card>
         </>
+      )}
+
+      {/* Confirmed history */}
+      {confirmed.length > 0 && (
+        <>
+          <SectionHeader title="Confirmed Cash Received" />
+          {confirmed.map((r) => (
+            <Card key={r.id} padding="sm" className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <CheckCircle2 className="h-5 w-5 text-emerald-500 shrink-0" />
+                <div>
+                  <p className="text-sm font-bold text-gray-900 dark:text-white">
+                    {r.rider_name?.split(" ")[0] || r.rider_id}
+                  </p>
+                  <p className="text-[11px] text-gray-500">{dateLabel(r.remittance_date)}</p>
+                </div>
+              </div>
+              <p className="text-sm font-black text-emerald-600 dark:text-emerald-400 tabular">{c(r.amount)}</p>
+            </Card>
+          ))}
+        </>
+      )}
+
+      {sorted.length === 0 && (
+        <EmptyState title="No remittances yet" message="When the rider submits daily cash, it will appear here" />
       )}
     </div>
   );
