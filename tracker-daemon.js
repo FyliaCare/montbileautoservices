@@ -419,7 +419,31 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
 
 function analyzeMovement(deviceId, loc) {
   const ds = getDeviceState(deviceId);
-  const speed = loc.speed_kmh;
+
+  // ── Calculate speed from consecutive GPS points (DAGPS sudu field is unreliable) ──
+  let computedSpeedKmh = 0;
+  if (ds.prevLatLng && loc.lat !== 0 && loc.lng !== 0) {
+    const [prevLat, prevLng, prevTime] = ds.prevLatLng;
+    const dist = distanceMeters(prevLat, prevLng, loc.lat, loc.lng);
+    const timeStr = loc.gps_time || loc.sys_time || "";
+    const prevT = prevTime || 0;
+    let nowT = 0;
+    if (timeStr) {
+      const cleaned = timeStr.replace(/\//g, "-");
+      const parsed = new Date(cleaned.includes("Z") || cleaned.includes("+") ? cleaned : cleaned + "Z");
+      if (!isNaN(parsed.getTime())) nowT = parsed.getTime();
+    }
+    const dtSec = nowT > 0 && prevT > 0 ? (nowT - prevT) / 1000 : 30; // fallback to poll interval
+    if (dtSec > 0 && dist > 3) {
+      // distance in meters, time in seconds → km/h
+      computedSpeedKmh = (dist / dtSec) * 3.6;
+      // Cap at reasonable speed (filter GPS jitter when parked)
+      if (computedSpeedKmh > 120) computedSpeedKmh = 0; // jitter
+    }
+  }
+
+  // Use DAGPS speed if non-zero, otherwise use our computed speed
+  const speed = loc.speed_kmh > 0 ? loc.speed_kmh : Math.round(computedSpeedKmh * 10) / 10;
 
   ds.speedHistory.push(speed);
   if (ds.speedHistory.length > MAX_SPEED_HISTORY) ds.speedHistory.shift();
@@ -441,22 +465,31 @@ function analyzeMovement(deviceId, loc) {
     }
   }
 
+  // ── Heading from consecutive moved points ──
   let heading = 0;
-  if (ds.prevLatLng && loc.lat !== 0 && loc.lng !== 0 && speed > 2) {
+  if (ds.prevLatLng && loc.lat !== 0 && loc.lng !== 0) {
     const [prevLat, prevLng] = ds.prevLatLng;
     if (distanceMeters(prevLat, prevLng, loc.lat, loc.lng) > 5) {
       heading = Math.round(computeBearing(prevLat, prevLng, loc.lat, loc.lng));
     }
   }
 
+  // Store current position + timestamp for next speed calculation
   if (loc.lat !== 0 && loc.lng !== 0) {
-    ds.prevLatLng = [loc.lat, loc.lng];
+    let currentTime = 0;
+    const timeStr = loc.gps_time || loc.sys_time || "";
+    if (timeStr) {
+      const cleaned = timeStr.replace(/\//g, "-");
+      const parsed = new Date(cleaned.includes("Z") || cleaned.includes("+") ? cleaned : cleaned + "Z");
+      if (!isNaN(parsed.getTime())) currentTime = parsed.getTime();
+    }
+    ds.prevLatLng = [loc.lat, loc.lng, currentTime];
   }
 
   let heartbeatAgeSec = Infinity;
-  const timeStr = loc.heart_time || loc.gps_time;
-  if (timeStr) {
-    const cleaned = timeStr.replace(/\//g, "-");
+  const hbTimeStr = loc.heart_time || loc.gps_time;
+  if (hbTimeStr) {
+    const cleaned = hbTimeStr.replace(/\//g, "-");
     const parsed = new Date(
       cleaned.includes("Z") || cleaned.includes("+") ? cleaned : cleaned + "Z"
     );
@@ -476,6 +509,7 @@ function analyzeMovement(deviceId, loc) {
   }
 
   return {
+    speed,
     heading,
     headingCompass: heading > 0 ? getCompassDirection(heading) : "—",
     heartbeatAgeSec: Math.round(heartbeatAgeSec === Infinity ? 999 : heartbeatAgeSec),
@@ -516,7 +550,9 @@ async function checkAlarm(deviceId, device, loc) {
 function buildLocationPayload(deviceId, device, loc, analysis) {
   const ds = getDeviceState(deviceId);
   const now = new Date().toISOString();
-  const speedMs = loc.speed_kmh > 0 ? loc.speed_kmh / 3.6 : null;
+  // Use computed speed (distance/time) since DAGPS sudu field is unreliable
+  const effectiveSpeed = analysis.speed || 0;
+  const speedMs = effectiveSpeed > 0 ? effectiveSpeed / 3.6 : null;
 
   return {
     rider_id: device.rider_id || deviceId,
@@ -534,7 +570,8 @@ function buildLocationPayload(deviceId, device, loc, analysis) {
     tracker_data: {
       gps_time: loc.gps_time,
       heart_time: loc.heart_time,
-      speed_kmh: loc.speed_kmh,
+      speed_kmh: effectiveSpeed,
+      speed_dagps: loc.speed_kmh,
       alarm: loc.alarm,
       signal: loc.signal,
       device_type: loc.device_type,
@@ -593,8 +630,9 @@ function renderDashboard() {
 
     output += `${C.bold}${C.cyan}║${C.reset}  📡 ${C.bold}${(device.name || device.imei).substring(0, 18)}${C.reset} ${onlineStr} ${movIcon}`;
     if (loc) {
-      const spdColor = loc.speed_kmh > 40 ? C.red : loc.speed_kmh > 20 ? C.yellow : loc.speed_kmh > 0 ? C.green : C.dim;
-      output += ` ${spdColor}${loc.speed_kmh}km/h${C.reset}`;
+      const spd = ds.computedSpeed || 0;
+      const spdColor = spd > 40 ? C.red : spd > 20 ? C.yellow : spd > 0 ? C.green : C.dim;
+      output += ` ${spdColor}${Math.round(spd)}km/h${C.reset}`;
     }
     output += `\n`;
   }
@@ -681,6 +719,7 @@ async function pollOnce() {
       ds.lastLocation = loc;
 
       const analysis = analyzeMovement(device.id, loc);
+      ds.computedSpeed = analysis.speed || 0;
       await checkAlarm(device.id, device, loc);
 
       const payload = buildLocationPayload(device.id, device, loc, analysis);
@@ -867,7 +906,7 @@ function startHealthServer() {
           const ds = getDeviceState(d.id);
           return {
             id: d.id, name: d.name, imei: d.imei, online: ds.online,
-            movement: ds.movement, speed: ds.lastLocation?.speed_kmh || 0,
+            movement: ds.movement, speed: ds.computedSpeed || 0,
             lat: ds.lastLocation?.lat || null, lng: ds.lastLocation?.lng || null,
           };
         }),
