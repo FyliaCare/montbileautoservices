@@ -1,0 +1,205 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+/* ─── Design Tokens — Bolt/Uber Inspired ─── */
+@theme {
+  /* Brand */
+  --color-gold: #F5A623;
+  --color-gold-dark: #D4911E;
+  --color-gold-light: #FDF0DB;
+
+  /* Bolt Green — rider accent */
+  --color-bolt: #34D399;
+  --color-bolt-dark: #10B981;
+  --color-bolt-light: #D1FAE5;
+
+  /* Forest */
+  --color-forest: #1B7A3D;
+  --color-forest-dark: #145C2E;
+  --color-forest-light: #E8F5EC;
+
+  /* Status */
+  --color-danger: #EF4444;
+  --color-danger-light: #FEE2E2;
+  --color-warning: #F59E0B;
+  --color-success: #22C55E;
+  --color-info: #3B82F6;
+
+  /* Dark surfaces */
+  --color-surface-900: #0B0E11;
+  --color-surface-800: #111318;
+  --color-surface-700: #1A1D24;
+  --color-surface-600: #22262F;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* Animations */
+  --animate-fade-in: fade-in 0.35s cubic-bezier(.4,0,.2,1);
+  --animate-slide-up: slide-up 0.4s cubic-bezier(.4,0,.2,1);
+  --animate-slide-down: slide-down 0.35s cubic-bezier(.4,0,.2,1);
+  --animate-scale-in: scale-in 0.3s cubic-bezier(.4,0,.2,1);
+  --animate-pulse-soft: pulse-soft 2s ease-in-out infinite;
+  --animate-shimmer: shimmer 2s linear infinite;
+  --animate-glow: glow-pulse 2s ease-in-out infinite;
+  --animate-bounce-in: bounce-in 0.5s cubic-bezier(.68,-.55,.27,1.55);
+  --animate-count-up: count-up 0.6s cubic-bezier(.4,0,.2,1);
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes slide-up {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes slide-down {
+    from { opacity: 0; transform: translateY(-12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes scale-in {
+    from { opacity: 0; transform: scale(0.92); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes pulse-soft {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  @keyframes glow-pulse {
+    0%, 100% { opacity: 0.7; }
+    50% { opacity: 1; }
+  }
+  @keyframes bounce-in {
+    0% { transform: scale(0.3); opacity: 0; }
+    50% { transform: scale(1.05); }
+    70% { transform: scale(0.95); }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  @keyframes count-up {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}
+
+/* ─── Base ─── */
+html {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-white text-gray-900 font-sans;
+  overscroll-behavior: none;
+}
+
+.dark body {
+  @apply bg-surface-900 text-gray-100;
+}
+
+/* ─── PWA Status Bar ─── */
+@supports (padding-top: env(safe-area-inset-top)) {
+  body { padding-top: env(safe-area-inset-top); }
+}
+
+/* ─── Scrollbar ─── */
+::-webkit-scrollbar { width: 3px; height: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+.dark ::-webkit-scrollbar-thumb { background: #374151; }
+
+/* ─── Form Inputs ─── */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] { -moz-appearance: textfield; }
+
+/* ─── Glassmorphism Utilities ─── */
+.glass {
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+}
+
+.glass-card {
+  @apply bg-white/80 border border-white/20;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.dark .glass-card {
+  @apply bg-surface-700/80 border-white/5;
+}
+
+/* ─── Gradient Utilities ─── */
+.gradient-bolt {
+  background: linear-gradient(135deg, #34D399 0%, #10B981 100%);
+}
+.gradient-gold {
+  background: linear-gradient(135deg, #F5A623 0%, #D4911E 100%);
+}
+.gradient-dark {
+  background: linear-gradient(180deg, #111318 0%, #0B0E11 100%);
+}
+.gradient-hero {
+  background: linear-gradient(135deg, #0B0E11 0%, #1A1D24 50%, #111318 100%);
+}
+
+/* ─── Skeleton Loader ─── */
+.skeleton {
+  @apply rounded-xl;
+  background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%);
+  background-size: 200% 100%;
+  animation: shimmer 2s linear infinite;
+}
+.dark .skeleton {
+  background: linear-gradient(90deg, #1f2937 25%, #374151 50%, #1f2937 75%);
+  background-size: 200% 100%;
+}
+
+/* ─── Active States for Mobile ─── */
+.tap-active {
+  transition: transform 0.1s, opacity 0.1s;
+}
+.tap-active:active {
+  transform: scale(0.97);
+  opacity: 0.9;
+}
+
+/* ─── Ring Animation for Shift Active ─── */
+.ring-active {
+  position: relative;
+}
+.ring-active::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 2px solid #34D399;
+  box-shadow: 0 0 12px rgba(52,211,153,0.4);
+  animation: glow-pulse 2s ease-in-out infinite;
+  will-change: opacity;
+}
+
+/* ─── Status Dot ─── */
+.status-online {
+  @apply relative;
+}
+.status-online::after {
+  content: '';
+  @apply absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-bolt border-2 border-white;
+  animation: pulse-soft 2s ease-in-out infinite;
+}
+.dark .status-online::after {
+  @apply border-surface-900;
+}
+
+/* ─── Tabular Numbers ─── */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
