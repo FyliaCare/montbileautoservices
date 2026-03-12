@@ -1,4 +1,4 @@
-app = "montbileautoservices"
+app = "montbile-tracker-daemon"
 primary_region = "lhr"
 
 [build]
