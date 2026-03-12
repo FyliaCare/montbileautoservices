@@ -1,28 +1,31 @@
 #!/usr/bin/env node
 /**
  * ═══════════════════════════════════════════════════════════════════════
- *  MONTBILE GPS TRACKER DAEMON v2.0
- *  Near Real-Time DAGPS → Firebase Bridge
+ *  MONTBILE GPS TRACKER DAEMON v3.0
+ *  Near Real-Time DAGPS → Firebase Bridge (Multi-Device, Self-Healing)
  * ═══════════════════════════════════════════════════════════════════════
  *
- *  Reverse-engineered from dagps.net. Polls the DAGPS hardware tracker
- *  every 10 seconds and pushes rich location data to Firebase RTDB
- *  where the Montbile fleet map picks it up instantly.
+ *  Reads tracker_config from Firebase RTDB for credentials and devices.
+ *  Polls DAGPS for ALL enabled devices and pushes enriched data to
+ *  Firebase where the fleet map picks it up instantly.
  *
  *  Features:
- *  ─ Near real-time polling (10s when moving, 30s when stationary)
- *  ─ Adaptive poll rate based on movement detection
- *  ─ Rich data: speed, GPS time, heartbeat, signal, alarm, online/offline
- *  ─ Computed heading from position deltas
- *  ─ Speed history (last 20 readings)
- *  ─ Movement trail (last 30 positions)
- *  ─ Auto session refresh on expiry
- *  ─ Error recovery with exponential backoff
- *  ─ Live console dashboard with colour output
+ *  ─ Dynamic configuration from Firebase (no hardcoded credentials)
+ *  ─ Multi-device support — polls all enabled devices in tracker_config
+ *  ─ Session auto-refresh before expiry (50 min of 60 min TTL)
+ *  ─ Exponential backoff on errors (max 5 min)
+ *  ─ Alarm detection → writes Firebase notifications
+ *  ─ Adaptive poll rate: 10s moving, 30s stationary, 60s idle
+ *  ─ Rich data: speed, heading, trail, signal, heartbeat, movement
+ *  ─ Health-check HTTP server for cloud hosting (Fly.io, Railway, etc.)
+ *  ─ Graceful shutdown writes offline status
  *  ─ Zero npm dependencies — pure Node.js
  *
  *  Usage:
  *    node tracker-daemon.js
+ *
+ *  Environment:
+ *    PORT — HTTP health server port (default 8080)
  *
  *  Runs until stopped with Ctrl+C.
  * ═══════════════════════════════════════════════════════════════════════
@@ -33,52 +36,32 @@ const https = require("https");
 
 // ─── Configuration ───────────────────────────────────────────────────
 
-const CONFIG = {
-  // DAGPS credentials (reverse-engineered login)
-  dagps: {
-    imei: "352672109749028",
-    password: "123456",
-    baseUrl: "http://www.dagps.net",
-  },
+const FIREBASE_DB_URL =
+  "https://montbile-services-default-rtdb.europe-west1.firebasedatabase.app";
 
-  // Firebase RTDB (REST API — zero dependencies)
-  firebase: {
-    dbUrl: "https://montbile-services-default-rtdb.europe-west1.firebasedatabase.app",
-  },
+const DAGPS_BASE_URL = "http://www.dagps.net";
 
-  // Rider assignment
-  rider: {
-    id: "rider_kuyht5",
-    name: "Ransford Kennedy Dankwah",
-  },
-
-  // Polling
-  poll: {
-    movingIntervalMs: 10_000,     // 10s when moving
-    stationaryIntervalMs: 30_000, // 30s when stationary
-    idleIntervalMs: 60_000,       // 60s when idle (no heartbeat for 5 min)
-    sessionRefreshMs: 50 * 60_000, // refresh session at 50 min (expires at 60)
-  },
-
-  // Data retention
-  history: {
-    maxSpeedHistory: 20,   // last 20 speed readings
-    maxTrailPoints: 30,    // last 30 GPS positions
-  },
+const POLL_INTERVALS = {
+  movingMs: 10_000,
+  stationaryMs: 30_000,
+  idleMs: 60_000,
 };
+
+const SESSION_REFRESH_BEFORE_EXPIRY_MS = 10 * 60_000; // refresh 10 min before expiry
+const CONFIG_RELOAD_INTERVAL_MS = 5 * 60_000; // re-read tracker_config every 5 min
+const MAX_SPEED_HISTORY = 20;
+const MAX_TRAIL_POINTS = 30;
+const MAX_RETRY_ATTEMPTS = 5;
+const HEARTBEAT_ONLINE_THRESHOLD_SEC = 300; // 5 min
 
 // ─── State ───────────────────────────────────────────────────────────
 
 const state = {
-  session: null,           // { mds, user_id, cookie, expires_at }
-  lastLocation: null,      // last parsed DAGPS response
-  prevLatLng: null,        // previous [lat, lng] for heading calc
-  speedHistory: [],        // last N speed readings (km/h)
-  trail: [],               // last N positions [{lat, lng, speed, t}]
-  movement: "unknown",     // "moving" | "stationary" | "idle"
-  online: false,           // device online based on heartbeat freshness
+  config: null,
+  configLastLoaded: 0,
+  session: null,
+  devices: {},
 
-  // Stats
   stats: {
     startTime: Date.now(),
     totalPolls: 0,
@@ -86,10 +69,25 @@ const state = {
     errorPolls: 0,
     firebaseWrites: 0,
     lastPollTime: null,
-    lastFirebaseWrite: null,
     consecutiveErrors: 0,
+    devicesPolled: 0,
   },
 };
+
+function getDeviceState(deviceId) {
+  if (!state.devices[deviceId]) {
+    state.devices[deviceId] = {
+      speedHistory: [],
+      trail: [],
+      prevLatLng: null,
+      movement: "unknown",
+      online: false,
+      lastLocation: null,
+      lastAlarm: 0,
+    };
+  }
+  return state.devices[deviceId];
+}
 
 // ─── ANSI Colour Helpers ─────────────────────────────────────────────
 
@@ -104,7 +102,6 @@ const C = {
   magenta: "\x1b[35m",
   cyan: "\x1b[36m",
   white: "\x1b[37m",
-  bgBlue: "\x1b[44m",
   bgGreen: "\x1b[42m",
   bgRed: "\x1b[41m",
   bgYellow: "\x1b[43m",
@@ -125,7 +122,7 @@ function httpRequest(url, options = {}) {
       path: parsed.pathname + parsed.search,
       method: options.method || "GET",
       headers: {
-        "User-Agent": "MontbileTrackerDaemon/2.0",
+        "User-Agent": "MontbileTrackerDaemon/3.0",
         ...options.headers,
       },
       timeout: options.timeout || 15000,
@@ -135,42 +132,135 @@ function httpRequest(url, options = {}) {
       const bodyBuf = Buffer.from(options.body, "utf-8");
       reqOptions.headers["Content-Length"] = bodyBuf.length;
       if (!reqOptions.headers["Content-Type"]) {
-        reqOptions.headers["Content-Type"] = "application/x-www-form-urlencoded";
+        reqOptions.headers["Content-Type"] =
+          "application/x-www-form-urlencoded";
       }
     }
 
     const req = lib.request(reqOptions, (res) => {
       let data = "";
-      res.on("data", (chunk) => { data += chunk; });
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
       res.on("end", () => {
-        resolve({
-          status: res.statusCode || 0,
-          headers: res.headers,
-          body: data,
-        });
+        resolve({ status: res.statusCode || 0, headers: res.headers, body: data });
       });
     });
 
     req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Request timeout")); });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Request timeout"));
+    });
 
     if (options.body) req.write(options.body);
     req.end();
   });
 }
 
+/** Retry a function with exponential backoff */
+async function withRetry(fn, label, maxAttempts = MAX_RETRY_ATTEMPTS) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === maxAttempts) {
+        log("❌", `${label} failed after ${maxAttempts} attempts: ${err.message}`);
+        throw err;
+      }
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+      log("⏳", `${label} attempt ${attempt}/${maxAttempts} failed, retrying in ${delay / 1000}s...`);
+      await sleep(delay);
+    }
+  }
+}
+
+// ─── Firebase RTDB (REST API) ────────────────────────────────────────
+
+async function firebaseRead(path) {
+  const url = `${FIREBASE_DB_URL}/${path}.json`;
+  const res = await httpRequest(url, { timeout: 10000 });
+  if (res.status !== 200) throw new Error(`Firebase read ${path} failed: ${res.status}`);
+  return JSON.parse(res.body);
+}
+
+async function firebaseWrite(path, data) {
+  const url = `${FIREBASE_DB_URL}/${path}.json`;
+  const res = await httpRequest(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+    timeout: 10000,
+  });
+  if (res.status !== 200) throw new Error(`Firebase write ${path} failed: ${res.status}`);
+  state.stats.firebaseWrites++;
+}
+
+async function firebasePatch(path, data) {
+  const url = `${FIREBASE_DB_URL}/${path}.json`;
+  const res = await httpRequest(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+    timeout: 10000,
+  });
+  if (res.status !== 200) throw new Error(`Firebase patch ${path} failed: ${res.status}`);
+}
+
+async function firebasePush(path, data) {
+  const url = `${FIREBASE_DB_URL}/${path}.json`;
+  const res = await httpRequest(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+    timeout: 10000,
+  });
+  if (res.status !== 200) throw new Error(`Firebase push ${path} failed: ${res.status}`);
+}
+
+// ─── Load Config from Firebase ───────────────────────────────────────
+
+async function loadConfig() {
+  const now = Date.now();
+  if (state.config && now - state.configLastLoaded < CONFIG_RELOAD_INTERVAL_MS) {
+    return state.config;
+  }
+
+  log("📋", "Loading tracker config from Firebase...");
+  const config = await firebaseRead("tracker_config");
+
+  if (!config || !config.account) {
+    throw new Error(
+      "No tracker_config in Firebase. Set up in Management → Settings → Tracker."
+    );
+  }
+
+  state.config = config;
+  state.configLastLoaded = now;
+
+  const deviceCount = config.devices ? Object.keys(config.devices).length : 0;
+  const enabledCount = config.devices
+    ? Object.values(config.devices).filter((d) => d.enabled !== false).length
+    : 0;
+  log("✅", `Config: account=${config.account}, ${enabledCount}/${deviceCount} devices enabled`);
+
+  return config;
+}
+
+function getEnabledDevices(config) {
+  if (!config?.devices) return [];
+  return Object.entries(config.devices)
+    .filter(([, d]) => d.enabled !== false)
+    .map(([id, d]) => ({ id, ...d }));
+}
+
 // ─── DAGPS API (Reverse-Engineered) ─────────────────────────────────
 
-/**
- * Login to DAGPS via the USER login form.
- * POST /LoginByUser.aspx?method=loginSystem
- * Returns session with mds token, user_id GUID, and ASP.NET cookie.
- */
-async function dagpsLogin() {
-  const { imei, password, baseUrl } = CONFIG.dagps;
+async function dagpsLogin(account, password) {
+  const serverUrl = state.config?.server_url || DAGPS_BASE_URL;
 
   const body = [
-    `userName=${encodeURIComponent(imei)}`,
+    `userName=${encodeURIComponent(account)}`,
     `pwd_=${encodeURIComponent(password)}`,
     `pwd=${encodeURIComponent(password)}`,
     `loginType=USER`,
@@ -180,13 +270,15 @@ async function dagpsLogin() {
     `loginUrl=`,
   ].join("&");
 
-  const res = await httpRequest(`${baseUrl}/LoginByUser.aspx?method=loginSystem`, {
-    method: "POST",
-    body,
-    headers: { Referer: `${baseUrl}/Skins/DefaultIndex/` },
-  });
+  const res = await httpRequest(
+    `${serverUrl}/LoginByUser.aspx?method=loginSystem`,
+    {
+      method: "POST",
+      body,
+      headers: { Referer: `${serverUrl}/Skins/DefaultIndex/` },
+    }
+  );
 
-  // Extract ASP.NET session cookie
   let cookie = "";
   const cookies = res.headers["set-cookie"];
   if (Array.isArray(cookies)) {
@@ -196,43 +288,47 @@ async function dagpsLogin() {
     cookie = cookies.split(";")[0];
   }
 
-  // Extract mds token from redirect script
   const mdsMatch = res.body.match(/mds=([a-f0-9]+)/i);
   if (!mdsMatch) {
-    throw new Error(`Login failed: no mds token. Status=${res.status} Body=${res.body.substring(0, 200)}`);
+    throw new Error(`Login failed: no mds token. Status=${res.status}`);
   }
   const mds = mdsMatch[1];
 
-  // Fetch dashboard to extract user_id GUID
-  const dashRes = await httpRequest(`${baseUrl}/user/indexp.aspx?mds=${mds}`, {
-    headers: { Cookie: cookie, Referer: `${baseUrl}/Skins/DefaultIndex/` },
+  const dashRes = await httpRequest(`${serverUrl}/user/indexp.aspx?mds=${mds}`, {
+    headers: { Cookie: cookie, Referer: `${serverUrl}/Skins/DefaultIndex/` },
   });
 
   let userId = "";
   const uidMatch = dashRes.body.match(/var loginUserId\s*=\s*'([^']+)'/);
   if (uidMatch) userId = uidMatch[1];
+  if (!userId) throw new Error("Login OK but could not extract user_id");
 
-  if (!userId) {
-    throw new Error("Login succeeded but could not extract user_id from dashboard");
-  }
-
-  return {
+  const session = {
     mds,
     user_id: userId,
     cookie,
-    expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), // 1 hour
+    expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
   };
+
+  // Share session with Cloud Functions
+  try {
+    await firebasePatch("tracker_config", {
+      session_token: session.mds,
+      session_user_id: session.user_id,
+      session_cookie: session.cookie,
+      session_expiry: session.expires_at,
+    });
+  } catch {
+    // Non-critical
+  }
+
+  return session;
 }
 
-/**
- * Fetch live device data from DAGPS.
- * GET /GetDataService.aspx?method=loadUser&mds={mds}&user_id={uid}
- * Returns parsed device data with ALL available fields.
- */
 async function dagpsFetchLocation(session) {
-  const { baseUrl } = CONFIG.dagps;
+  const serverUrl = state.config?.server_url || DAGPS_BASE_URL;
 
-  let url = `${baseUrl}/GetDataService.aspx?method=loadUser&mds=${session.mds}&callback=cb`;
+  let url = `${serverUrl}/GetDataService.aspx?method=loadUser&mds=${session.mds}&callback=cb`;
   if (session.user_id) {
     url += `&user_id=${encodeURIComponent(session.user_id)}`;
   }
@@ -240,100 +336,71 @@ async function dagpsFetchLocation(session) {
   const res = await httpRequest(url, {
     headers: {
       Cookie: session.cookie,
-      Referer: `${baseUrl}/user/indexp.aspx?mds=${session.mds}`,
+      Referer: `${serverUrl}/user/indexp.aspx?mds=${session.mds}`,
     },
     timeout: 10000,
   });
 
-  if (res.status !== 200) return null;
+  if (res.status !== 200) return [];
 
-  // Parse JSONP: cb({...})
   const jsonStr = res.body.replace(/^cb\(/, "").replace(/\);?\s*$/, "");
   const json = JSON.parse(jsonStr);
+  if (json.success !== "true" || !json.data) return [];
 
-  if (json.success !== "true" || !json.data || !json.data[0]) return null;
-
-  const d = json.data[0];
-  return {
+  return json.data.map((d) => ({
     lat: parseFloat(d.weidu) || 0,
     lng: parseFloat(d.jingdu) || 0,
     speed_kmh: parseFloat(d.sudu) || 0,
-    gps_time: d.datetime || "",            // Last GPS fix time
-    heart_time: d.heart_time || "",        // Last device heartbeat
-    sys_time: d.sys_time || "",            // Server time
-    alarm: parseInt(d.alarm) || 0,         // 0=none, 1+=alarm
-    signal: parseInt(d.grade) || 0,        // Signal quality
-    device_type: d.product_type || "GT06", // Hardware model
-    imei: d.sim_id || CONFIG.dagps.imei,
+    gps_time: d.datetime || "",
+    heart_time: d.heart_time || "",
+    sys_time: d.sys_time || "",
+    alarm: parseInt(d.alarm) || 0,
+    signal: parseInt(d.grade) || 0,
+    device_type: d.product_type || "GT06",
+    imei: d.sim_id || "",
     device_name: d.user_name || "",
     status_raw: d.status || "",
-    icon_type: d.iconType || "",
-    speed_duration: parseInt(d.SpeedDuration) || 0,
-    jingwei: d.jingwei || "",              // Combined "lng;lat"
-  };
+  }));
 }
 
-// ─── Firebase RTDB (REST API) ────────────────────────────────────────
+// ─── Session Management ──────────────────────────────────────────────
 
-/**
- * Write rider location to Firebase RTDB via REST API.
- * PUT /rider_locations/tracker-{imei}.json
- */
-async function firebaseWriteLocation(locationData) {
-  const deviceKey = `tracker-${CONFIG.dagps.imei}`;
-  const url = `${CONFIG.firebase.dbUrl}/rider_locations/${deviceKey}.json`;
+async function ensureSession() {
+  if (!state.config) throw new Error("No config loaded");
 
-  const res = await httpRequest(url, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(locationData),
-    timeout: 10000,
-  });
-
-  if (res.status !== 200) {
-    throw new Error(`Firebase write failed: ${res.status} ${res.body.substring(0, 200)}`);
+  if (state.session) {
+    const expiresAt = new Date(state.session.expires_at).getTime();
+    const refreshAt = expiresAt - SESSION_REFRESH_BEFORE_EXPIRY_MS;
+    if (Date.now() < refreshAt) return;
+    log("🔄", "Session nearing expiry, refreshing...");
   }
 
-  state.stats.firebaseWrites++;
-  state.stats.lastFirebaseWrite = new Date();
+  log("🔑", "Logging into DAGPS...");
+  state.session = await withRetry(
+    () => dagpsLogin(state.config.account, state.config.password),
+    "DAGPS login"
+  );
+  log("✅", `Session acquired: mds=${state.session.mds.substring(0, 16)}...`);
 }
 
-/**
- * Update tracker device status in Firebase.
- */
-async function firebaseUpdateDevice(data) {
-  const deviceKey = `tracker-${CONFIG.dagps.imei}`;
-  const url = `${CONFIG.firebase.dbUrl}/tracker_config/devices/${deviceKey}.json`;
-
-  // PATCH via POST with X-HTTP-Method-Override
-  const res = await httpRequest(url, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-    timeout: 10000,
-  });
-
-  return res.status === 200;
-}
-
-// ─── Heading Calculation ─────────────────────────────────────────────
+// ─── Heading & Distance Calculations ─────────────────────────────────
 
 function computeBearing(lat1, lon1, lat2, lon2) {
   const toRad = (d) => (d * Math.PI) / 180;
   const toDeg = (r) => (r * 180) / Math.PI;
-
   const dLon = toRad(lon2 - lon1);
   const y = Math.sin(dLon) * Math.cos(toRad(lat2));
-  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
-            Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
-
-  let bearing = toDeg(Math.atan2(y, x));
-  return (bearing + 360) % 360; // Normalize to 0-360
+  const x =
+    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
 }
 
 function getCompassDirection(bearing) {
-  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-                "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  const dirs = [
+    "N","NNE","NE","ENE","E","ESE","SE","SSE",
+    "S","SSW","SW","WSW","W","WNW","NW","NNW",
+  ];
   return dirs[Math.round(bearing / 22.5) % 16];
 }
 
@@ -342,113 +409,128 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   const toRad = (d) => (d * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ─── Movement Analysis ───────────────────────────────────────────────
+// ─── Movement Analysis (per-device) ─────────────────────────────────
 
-function analyzeMovement(loc) {
+function analyzeMovement(deviceId, loc) {
+  const ds = getDeviceState(deviceId);
   const speed = loc.speed_kmh;
 
-  // Update speed history
-  state.speedHistory.push(speed);
-  if (state.speedHistory.length > CONFIG.history.maxSpeedHistory) {
-    state.speedHistory.shift();
-  }
+  ds.speedHistory.push(speed);
+  if (ds.speedHistory.length > MAX_SPEED_HISTORY) ds.speedHistory.shift();
 
-  // Update trail
   if (loc.lat !== 0 && loc.lng !== 0) {
-    const lastTrail = state.trail[state.trail.length - 1];
-    // Only add to trail if position changed or speed > 0
-    if (!lastTrail ||
-        distanceMeters(lastTrail.lat, lastTrail.lng, loc.lat, loc.lng) > 3 ||
-        speed > 0) {
-      state.trail.push({
+    const lastTrail = ds.trail[ds.trail.length - 1];
+    if (
+      !lastTrail ||
+      distanceMeters(lastTrail.lat, lastTrail.lng, loc.lat, loc.lng) > 3 ||
+      speed > 0
+    ) {
+      ds.trail.push({
         lat: loc.lat,
         lng: loc.lng,
         speed: speed,
         t: loc.gps_time || new Date().toISOString(),
       });
-      if (state.trail.length > CONFIG.history.maxTrailPoints) {
-        state.trail.shift();
-      }
+      if (ds.trail.length > MAX_TRAIL_POINTS) ds.trail.shift();
     }
   }
 
-  // Compute heading from consecutive positions
   let heading = 0;
-  if (state.prevLatLng && loc.lat !== 0 && loc.lng !== 0 && speed > 2) {
-    const [prevLat, prevLng] = state.prevLatLng;
-    const dist = distanceMeters(prevLat, prevLng, loc.lat, loc.lng);
-    if (dist > 5) { // Only compute heading if moved > 5 meters
+  if (ds.prevLatLng && loc.lat !== 0 && loc.lng !== 0 && speed > 2) {
+    const [prevLat, prevLng] = ds.prevLatLng;
+    if (distanceMeters(prevLat, prevLng, loc.lat, loc.lng) > 5) {
       heading = Math.round(computeBearing(prevLat, prevLng, loc.lat, loc.lng));
     }
   }
 
-  // Update previous position
   if (loc.lat !== 0 && loc.lng !== 0) {
-    state.prevLatLng = [loc.lat, loc.lng];
+    ds.prevLatLng = [loc.lat, loc.lng];
   }
 
-  // Determine heartbeat freshness (DAGPS times are UTC+0)
   let heartbeatAgeSec = Infinity;
-  if (loc.heart_time) {
-    const htStr = loc.heart_time.replace(/\//g, "-");
-    // Append Z to force UTC parsing — DAGPS timeZone=0
-    const heartTime = new Date(htStr.includes("Z") || htStr.includes("+") ? htStr : htStr + "Z");
-    if (!isNaN(heartTime.getTime())) {
-      heartbeatAgeSec = (Date.now() - heartTime.getTime()) / 1000;
+  const timeStr = loc.heart_time || loc.gps_time;
+  if (timeStr) {
+    const cleaned = timeStr.replace(/\//g, "-");
+    const parsed = new Date(
+      cleaned.includes("Z") || cleaned.includes("+") ? cleaned : cleaned + "Z"
+    );
+    if (!isNaN(parsed.getTime())) {
+      heartbeatAgeSec = (Date.now() - parsed.getTime()) / 1000;
     }
   }
-  // Also check GPS time as a fallback for freshness
-  if (heartbeatAgeSec === Infinity && loc.gps_time) {
-    const gpsStr = loc.gps_time.replace(/\//g, "-");
-    const gpsTime = new Date(gpsStr.includes("Z") || gpsStr.includes("+") ? gpsStr : gpsStr + "Z");
-    if (!isNaN(gpsTime.getTime())) {
-      heartbeatAgeSec = (Date.now() - gpsTime.getTime()) / 1000;
-    }
-  }
-  state.online = heartbeatAgeSec < 300; // Online if heartbeat within 5 min
 
-  // Determine movement state
+  ds.online = heartbeatAgeSec < HEARTBEAT_ONLINE_THRESHOLD_SEC;
+
   if (speed > 2) {
-    state.movement = "moving";
-  } else if (heartbeatAgeSec > 300) {
-    state.movement = "idle";
+    ds.movement = "moving";
+  } else if (heartbeatAgeSec > HEARTBEAT_ONLINE_THRESHOLD_SEC) {
+    ds.movement = "idle";
   } else {
-    state.movement = "stationary";
+    ds.movement = "stationary";
   }
 
   return {
     heading,
     headingCompass: heading > 0 ? getCompassDirection(heading) : "—",
-    heartbeatAgeSec,
+    heartbeatAgeSec: Math.round(heartbeatAgeSec === Infinity ? 999 : heartbeatAgeSec),
   };
+}
+
+// ─── Alarm Detection ─────────────────────────────────────────────────
+
+async function checkAlarm(deviceId, device, loc) {
+  const ds = getDeviceState(deviceId);
+
+  if (loc.alarm > 0 && ds.lastAlarm === 0) {
+    log("🚨", `ALARM on ${device.name || deviceId}: code=${loc.alarm}`);
+    try {
+      await firebasePush("notifications", {
+        type: "tracker_alarm",
+        title: `🚨 Tracker Alarm: ${device.name || deviceId}`,
+        message: `Alarm triggered (code ${loc.alarm}) at ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}. Speed: ${loc.speed_kmh} km/h.`,
+        device_id: deviceId,
+        imei: device.imei,
+        lat: loc.lat,
+        lng: loc.lng,
+        speed: loc.speed_kmh,
+        alarm_code: loc.alarm,
+        timestamp: new Date().toISOString(),
+        read: false,
+      });
+    } catch (err) {
+      log("❌", `Failed to write alarm: ${err.message}`);
+    }
+  }
+
+  ds.lastAlarm = loc.alarm;
 }
 
 // ─── Build Firebase Payload ──────────────────────────────────────────
 
-function buildLocationPayload(loc, analysis) {
+function buildLocationPayload(deviceId, device, loc, analysis) {
+  const ds = getDeviceState(deviceId);
   const now = new Date().toISOString();
-  const speedMs = loc.speed_kmh > 0 ? loc.speed_kmh / 3.6 : null; // Convert km/h to m/s
+  const speedMs = loc.speed_kmh > 0 ? loc.speed_kmh / 3.6 : null;
 
   return {
-    // Base fields (compatible with existing fleet map)
-    rider_id: CONFIG.rider.id,
-    rider_name: CONFIG.rider.name,
+    rider_id: device.rider_id || deviceId,
+    rider_name: device.rider_name || device.name || `Tracker ${device.imei}`,
     lat: loc.lat,
     lng: loc.lng,
-    accuracy: 5,  // Hardware GPS is typically 5-10m
+    accuracy: 5,
     speed: speedMs,
     heading: analysis.heading > 0 ? analysis.heading : null,
     timestamp: now,
-    shift_id: `tracker-${CONFIG.dagps.imei}`,
-    status: "idle",  // Always idle — tracker online ≠ rider on shift. Use tracker_data.online for device state.
+    shift_id: deviceId,
+    status: "idle",
     source: "tracker",
 
-    // Enhanced tracker data (new!)
     tracker_data: {
       gps_time: loc.gps_time,
       heart_time: loc.heart_time,
@@ -456,14 +538,14 @@ function buildLocationPayload(loc, analysis) {
       alarm: loc.alarm,
       signal: loc.signal,
       device_type: loc.device_type,
-      imei: loc.imei,
-      online: state.online,
-      movement: state.movement,
+      imei: loc.imei || device.imei,
+      online: ds.online,
+      movement: ds.movement,
       heading_computed: analysis.heading,
       heading_compass: analysis.headingCompass,
-      heartbeat_age_sec: Math.round(analysis.heartbeatAgeSec),
-      speed_history: [...state.speedHistory],
-      trail: state.trail.slice(-CONFIG.history.maxTrailPoints),
+      heartbeat_age_sec: analysis.heartbeatAgeSec,
+      speed_history: [...ds.speedHistory],
+      trail: ds.trail.slice(-MAX_TRAIL_POINTS),
       poll_count: state.stats.totalPolls,
       daemon_uptime_sec: Math.round((Date.now() - state.stats.startTime) / 1000),
     },
@@ -472,98 +554,71 @@ function buildLocationPayload(loc, analysis) {
 
 // ─── Console Dashboard ───────────────────────────────────────────────
 
+let dashboardMode = false;
+
 function renderDashboard() {
   const now = new Date();
-  const uptime = formatDuration(Date.now() - state.stats.startTime);
-  const loc = state.lastLocation;
+  const uptime = formatDuration(Math.round((Date.now() - state.stats.startTime) / 1000));
   const s = state.stats;
 
   const sessionExpiry = state.session ? new Date(state.session.expires_at) : null;
   const sessionMins = sessionExpiry ? Math.max(0, Math.round((sessionExpiry - now) / 60000)) : 0;
 
-  const successRate = s.totalPolls > 0
-    ? ((s.successPolls / s.totalPolls) * 100).toFixed(1)
-    : "0.0";
+  const successRate = s.totalPolls > 0 ? ((s.successPolls / s.totalPolls) * 100).toFixed(1) : "0";
+  const devices = state.config ? getEnabledDevices(state.config) : [];
 
-  const pollInterval = state.movement === "moving"
-    ? CONFIG.poll.movingIntervalMs / 1000
-    : state.movement === "idle"
-      ? CONFIG.poll.idleIntervalMs / 1000
-      : CONFIG.poll.stationaryIntervalMs / 1000;
-
-  // Determine status indicator
-  const statusIcon = s.consecutiveErrors > 3
-    ? `${C.bgRed}${C.white} ERROR ${C.reset}`
-    : state.online
-      ? `${C.bgGreen}${C.white} ONLINE ${C.reset}`
-      : `${C.bgYellow}${C.white} OFFLINE ${C.reset}`;
-
-  const movementIcon = state.movement === "moving" ? "🚀"
-    : state.movement === "stationary" ? "🅿️"
-    : "💤";
-
-  const speedBar = loc ? buildSpeedBar(loc.speed_kmh) : "";
+  const statusIcon =
+    s.consecutiveErrors > 3
+      ? `${C.bgRed}${C.white} ERROR ${C.reset}`
+      : devices.some((d) => getDeviceState(d.id).online)
+        ? `${C.bgGreen}${C.white} ONLINE ${C.reset}`
+        : `${C.bgYellow}${C.white} OFFLINE ${C.reset}`;
 
   let output = C.clear;
   output += `${C.bold}${C.cyan}╔═══════════════════════════════════════════════════════════╗${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  ${C.bold}${C.white}MONTBILE GPS TRACKER DAEMON${C.reset} ${C.dim}v2.0${C.reset}                      ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Near Real-Time DAGPS → Firebase Bridge${C.reset}                ${C.bold}${C.cyan}║${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  ${C.bold}${C.white}MONTBILE GPS TRACKER DAEMON${C.reset} ${C.dim}v3.0${C.reset}                      ${C.bold}${C.cyan}║${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Multi-Device DAGPS → Firebase Bridge${C.reset}                  ${C.bold}${C.cyan}║${C.reset}\n`;
   output += `${C.bold}${C.cyan}╠═══════════════════════════════════════════════════════════╣${C.reset}\n`;
   output += `${C.bold}${C.cyan}║${C.reset}  Status:    ${statusIcon}                                       ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  Session:   ${C.green}mds=${state.session?.mds?.substring(0, 12) || "—"}...${C.reset} ${C.dim}(${sessionMins}m left)${C.reset}       ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  Poll Rate: ${C.yellow}${pollInterval}s${C.reset} ${C.dim}(${state.movement})${C.reset}                            ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  Uptime:    ${C.white}${uptime}${C.reset}                                    ${C.bold}${C.cyan}║${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  Session:   ${C.green}${sessionMins}m remaining${C.reset}                                ${C.bold}${C.cyan}║${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  Devices:   ${C.white}${devices.length} enabled${C.reset}                                   ${C.bold}${C.cyan}║${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  Uptime:    ${C.white}${uptime}${C.reset}                                       ${C.bold}${C.cyan}║${C.reset}\n`;
   output += `${C.bold}${C.cyan}╠═══════════════════════════════════════════════════════════╣${C.reset}\n`;
 
-  if (loc) {
-    output += `${C.bold}${C.cyan}║${C.reset}  ${C.bold}DEVICE:${C.reset} ${C.white}${loc.device_name || "GT0609749028"}${C.reset} ${C.dim}(${loc.imei})${C.reset}  ${C.bold}${C.cyan}║${C.reset}\n`;
-    output += `${C.bold}${C.cyan}║${C.reset}  ${C.bold}RIDER:${C.reset}  ${C.white}${CONFIG.rider.name}${C.reset}         ${C.bold}${C.cyan}║${C.reset}\n`;
-    output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}─────────────────────────────────────────────────────${C.reset}  ${C.bold}${C.cyan}║${C.reset}\n`;
-    output += `${C.bold}${C.cyan}║${C.reset}  📍 ${C.bold}Position:${C.reset}  ${C.white}${loc.lat.toFixed(6)}, ${loc.lng.toFixed(6)}${C.reset}             ${C.bold}${C.cyan}║${C.reset}\n`;
+  for (const device of devices) {
+    const ds = getDeviceState(device.id);
+    const loc = ds.lastLocation;
+    const onlineStr = ds.online ? `${C.green}● ON${C.reset}` : `${C.red}● OFF${C.reset}`;
+    const movIcon = ds.movement === "moving" ? "🚀" : ds.movement === "stationary" ? "🅿️" : "💤";
 
-    const speedColor = loc.speed_kmh > 40 ? C.red : loc.speed_kmh > 20 ? C.yellow : loc.speed_kmh > 0 ? C.green : C.dim;
-    output += `${C.bold}${C.cyan}║${C.reset}  ${movementIcon} ${C.bold}Speed:${C.reset}     ${speedColor}${loc.speed_kmh} km/h${C.reset} ${speedBar}           ${C.bold}${C.cyan}║${C.reset}\n`;
-    output += `${C.bold}${C.cyan}║${C.reset}  🕐 ${C.bold}GPS Time:${C.reset}  ${C.white}${loc.gps_time || "—"}${C.reset}             ${C.bold}${C.cyan}║${C.reset}\n`;
-
-    const hbAge = state.lastLocation ? Math.round(analyzeMovement.lastHeartbeatAge || 0) : 0;
-    const hbColor = hbAge < 30 ? C.green : hbAge < 120 ? C.yellow : C.red;
-    output += `${C.bold}${C.cyan}║${C.reset}  💓 ${C.bold}Heartbeat:${C.reset} ${hbColor}${loc.heart_time || "—"}${C.reset} ${C.dim}(${hbAge}s ago)${C.reset}  ${C.bold}${C.cyan}║${C.reset}\n`;
-    output += `${C.bold}${C.cyan}║${C.reset}  📡 ${C.bold}Signal:${C.reset}    ${loc.signal}  ${C.bold}Alarm:${C.reset} ${loc.alarm === 0 ? `${C.green}None${C.reset}` : `${C.red}⚠ ACTIVE${C.reset}`}             ${C.bold}${C.cyan}║${C.reset}\n`;
-
-    if (state.speedHistory.length > 0) {
-      const miniChart = state.speedHistory.slice(-10).map(s =>
-        s > 30 ? "█" : s > 20 ? "▆" : s > 10 ? "▄" : s > 2 ? "▂" : "▁"
-      ).join("");
-      output += `${C.bold}${C.cyan}║${C.reset}  📊 ${C.bold}Speed Graph:${C.reset} ${C.green}${miniChart}${C.reset}                          ${C.bold}${C.cyan}║${C.reset}\n`;
+    output += `${C.bold}${C.cyan}║${C.reset}  📡 ${C.bold}${(device.name || device.imei).substring(0, 18)}${C.reset} ${onlineStr} ${movIcon}`;
+    if (loc) {
+      const spdColor = loc.speed_kmh > 40 ? C.red : loc.speed_kmh > 20 ? C.yellow : loc.speed_kmh > 0 ? C.green : C.dim;
+      output += ` ${spdColor}${loc.speed_kmh}km/h${C.reset}`;
     }
-  } else {
-    output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Waiting for first data...${C.reset}                              ${C.bold}${C.cyan}║${C.reset}\n`;
+    output += `\n`;
+  }
+
+  if (devices.length === 0) {
+    output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}No devices. Add in Settings → Tracker.${C.reset}\n`;
   }
 
   output += `${C.bold}${C.cyan}╠═══════════════════════════════════════════════════════════╣${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  🔄 Polls: ${C.white}${s.totalPolls}${C.reset}  ✅ ${C.green}${s.successPolls}${C.reset}  ❌ ${C.red}${s.errorPolls}${C.reset}  Rate: ${C.white}${successRate}%${C.reset}      ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  🔥 Firebase writes: ${C.white}${s.firebaseWrites}${C.reset}                              ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Trail: ${state.trail.length} points | History: ${state.speedHistory.length} readings${C.reset}      ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}╠═══════════════════════════════════════════════════════════╣${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Last poll: ${s.lastPollTime ? timeAgo(s.lastPollTime) : "never"}${C.reset}                                   ${C.bold}${C.cyan}║${C.reset}\n`;
-  output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Press Ctrl+C to stop${C.reset}                                    ${C.bold}${C.cyan}║${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  🔄 Polls: ${C.white}${s.totalPolls}${C.reset}  ✅ ${C.green}${s.successPolls}${C.reset}  ❌ ${C.red}${s.errorPolls}${C.reset}  Rate: ${C.white}${successRate}%${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  🔥 Firebase writes: ${C.white}${s.firebaseWrites}${C.reset}\n`;
+  output += `${C.bold}${C.cyan}║${C.reset}  ${C.dim}Last: ${s.lastPollTime ? timeAgo(s.lastPollTime) : "never"} | Ctrl+C to stop${C.reset}\n`;
   output += `${C.bold}${C.cyan}╚═══════════════════════════════════════════════════════════╝${C.reset}\n`;
 
   process.stdout.write(output);
 }
 
-function buildSpeedBar(speed) {
-  const bars = Math.min(Math.round(speed / 5), 12);
-  const color = speed > 40 ? C.red : speed > 20 ? C.yellow : C.green;
-  return `${color}${"█".repeat(bars)}${C.dim}${"░".repeat(12 - bars)}${C.reset}`;
-}
+// ─── Helpers ─────────────────────────────────────────────────────────
 
-function formatDuration(ms) {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${h}h ${m}m ${sec}s`;
+function formatDuration(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${h}h ${m}m ${s}s`;
 }
 
 function timeAgo(date) {
@@ -573,62 +628,16 @@ function timeAgo(date) {
   return `${Math.floor(sec / 3600)}h ago`;
 }
 
-// ─── Session Management ──────────────────────────────────────────────
-
-async function ensureSession() {
-  // Check if session exists and is valid
-  if (state.session) {
-    const expiresAt = new Date(state.session.expires_at);
-    const refreshAt = new Date(expiresAt.getTime() - CONFIG.poll.sessionRefreshMs);
-
-    if (Date.now() < refreshAt.getTime()) {
-      return; // Session still valid
-    }
-  }
-
-  // Need to login
-  log("🔑", "Logging into DAGPS...");
-  state.session = await dagpsLogin();
-  log("✅", `Session acquired: mds=${state.session.mds.substring(0, 16)}... user_id=${state.session.user_id.substring(0, 8)}...`);
-
-  // Save session to Firebase for the Cloud Functions to use too
-  try {
-    await httpRequest(`${CONFIG.firebase.dbUrl}/tracker_config/session_token.json`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.session.mds),
-    });
-    await httpRequest(`${CONFIG.firebase.dbUrl}/tracker_config/session_user_id.json`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.session.user_id),
-    });
-    await httpRequest(`${CONFIG.firebase.dbUrl}/tracker_config/session_cookie.json`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.session.cookie),
-    });
-    await httpRequest(`${CONFIG.firebase.dbUrl}/tracker_config/session_expiry.json`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.session.expires_at),
-    });
-  } catch {
-    // Non-critical: session saved locally even if Firebase save fails
-  }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-// ─── Logging ─────────────────────────────────────────────────────────
 
 function log(icon, msg) {
   const time = new Date().toLocaleTimeString();
-  // Don't log during dashboard mode unless it's an error
   if (!dashboardMode) {
     console.log(`${C.dim}[${time}]${C.reset} ${icon} ${msg}`);
   }
 }
-
-let dashboardMode = false;
 
 // ─── Main Poll Cycle ─────────────────────────────────────────────────
 
@@ -637,110 +646,145 @@ async function pollOnce() {
   state.stats.lastPollTime = new Date();
 
   try {
-    // Ensure we have a valid session
+    // 1. Load/refresh config from Firebase
+    await loadConfig();
+
+    if (!state.config?.enabled) {
+      log("⏸️", "Tracker disabled in config. Sleeping...");
+      return;
+    }
+
+    // 2. Ensure valid DAGPS session
     await ensureSession();
 
-    // Fetch location from DAGPS
-    const loc = await dagpsFetchLocation(state.session);
-
-    if (!loc || (loc.lat === 0 && loc.lng === 0)) {
+    // 3. Fetch ALL device locations from DAGPS
+    const allLocations = await dagpsFetchLocation(state.session);
+    if (!allLocations || allLocations.length === 0) {
       state.stats.errorPolls++;
       state.stats.consecutiveErrors++;
       return;
     }
 
-    state.lastLocation = loc;
-    state.stats.successPolls++;
-    state.stats.consecutiveErrors = 0;
+    // 4. Match DAGPS results to configured devices
+    const enabledDevices = getEnabledDevices(state.config);
+    let matchedAny = false;
 
-    // Analyze movement, compute heading, update history
-    const analysis = analyzeMovement(loc);
-    analyzeMovement.lastHeartbeatAge = analysis.heartbeatAgeSec;
+    for (const device of enabledDevices) {
+      const loc = allLocations.find(
+        (l) => l.imei === device.imei || l.imei === device.imei?.replace(/^0+/, "")
+      );
 
-    // Build enriched location payload
-    const payload = buildLocationPayload(loc, analysis);
+      if (!loc || (loc.lat === 0 && loc.lng === 0)) continue;
 
-    // Write to Firebase RTDB
-    await firebaseWriteLocation(payload);
+      matchedAny = true;
+      const ds = getDeviceState(device.id);
+      ds.lastLocation = loc;
 
-    // Update device last-seen in Firebase
-    await firebaseUpdateDevice({
-      last_lat: loc.lat,
-      last_lng: loc.lng,
-      last_speed: loc.speed_kmh,
-      last_seen: new Date().toISOString(),
-    });
+      const analysis = analyzeMovement(device.id, loc);
+      await checkAlarm(device.id, device, loc);
 
-    // Also update the poll timestamp
-    await httpRequest(`${CONFIG.firebase.dbUrl}/tracker_config/last_poll.json`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(new Date().toISOString()),
+      const payload = buildLocationPayload(device.id, device, loc, analysis);
+      await firebaseWrite(`rider_locations/${device.id}`, payload);
+
+      await firebasePatch(`tracker_config/devices/${device.id}`, {
+        last_lat: loc.lat,
+        last_lng: loc.lng,
+        last_speed: loc.speed_kmh,
+        last_seen: new Date().toISOString(),
+      });
+    }
+
+    if (matchedAny) {
+      state.stats.successPolls++;
+      state.stats.consecutiveErrors = 0;
+      state.stats.devicesPolled = enabledDevices.length;
+    } else {
+      state.stats.errorPolls++;
+      state.stats.consecutiveErrors++;
+      log("⚠️", `No matching devices in DAGPS response (${allLocations.length} returned, ${enabledDevices.length} configured)`);
+    }
+
+    await firebasePatch("tracker_config", {
+      last_poll: new Date().toISOString(),
+      last_error: null,
     });
 
   } catch (err) {
     state.stats.errorPolls++;
     state.stats.consecutiveErrors++;
 
-    // If login error, clear session to force re-login
-    if (err.message && (err.message.includes("Login failed") || err.message.includes("mds"))) {
+    if (err.message && (err.message.includes("Login failed") || err.message.includes("mds") || err.message.includes("401"))) {
       state.session = null;
     }
 
-    if (!dashboardMode) {
-      log("❌", `Error: ${err.message}`);
+    try {
+      await firebasePatch("tracker_config", {
+        last_error: `${new Date().toISOString()}: ${err.message}`,
+      });
+    } catch {
+      // Ignore
     }
+
+    if (!dashboardMode) log("❌", `Poll error: ${err.message}`);
   }
 }
 
 function getNextInterval() {
-  // Exponential backoff on consecutive errors
   if (state.stats.consecutiveErrors > 0) {
-    const backoff = Math.min(
-      CONFIG.poll.idleIntervalMs * Math.pow(1.5, state.stats.consecutiveErrors),
-      5 * 60_000 // Max 5 min backoff
+    return Math.min(
+      POLL_INTERVALS.idleMs * Math.pow(1.5, state.stats.consecutiveErrors),
+      5 * 60_000
     );
-    return backoff;
   }
 
-  switch (state.movement) {
-    case "moving":     return CONFIG.poll.movingIntervalMs;
-    case "stationary": return CONFIG.poll.stationaryIntervalMs;
-    case "idle":       return CONFIG.poll.idleIntervalMs;
-    default:           return CONFIG.poll.stationaryIntervalMs;
+  const devices = state.config ? getEnabledDevices(state.config) : [];
+  let fastest = POLL_INTERVALS.idleMs;
+  for (const device of devices) {
+    const ds = getDeviceState(device.id);
+    const interval =
+      ds.movement === "moving" ? POLL_INTERVALS.movingMs :
+      ds.movement === "stationary" ? POLL_INTERVALS.stationaryMs :
+      POLL_INTERVALS.idleMs;
+    if (interval < fastest) fastest = interval;
   }
+  return fastest;
 }
 
 // ─── Main Loop ───────────────────────────────────────────────────────
 
 async function main() {
   console.log(`\n${C.bold}${C.cyan}═══════════════════════════════════════════════════════${C.reset}`);
-  console.log(`${C.bold}  🏍️  MONTBILE GPS TRACKER DAEMON v2.0${C.reset}`);
-  console.log(`${C.bold}  📡 DAGPS → Firebase Near Real-Time Bridge${C.reset}`);
+  console.log(`${C.bold}  🏍️  MONTBILE GPS TRACKER DAEMON v3.0${C.reset}`);
+  console.log(`${C.bold}  📡 Multi-Device DAGPS → Firebase Bridge${C.reset}`);
   console.log(`${C.bold}${C.cyan}═══════════════════════════════════════════════════════${C.reset}\n`);
 
-  console.log(`${C.dim}Device:${C.reset}  ${CONFIG.dagps.imei}`);
-  console.log(`${C.dim}Rider:${C.reset}   ${CONFIG.rider.name}`);
-  console.log(`${C.dim}Firebase:${C.reset} ${CONFIG.firebase.dbUrl}`);
-  console.log(`${C.dim}Polling:${C.reset}  ${CONFIG.poll.movingIntervalMs / 1000}s (moving) / ${CONFIG.poll.stationaryIntervalMs / 1000}s (parked) / ${CONFIG.poll.idleIntervalMs / 1000}s (idle)\n`);
+  console.log(`${C.dim}Firebase:${C.reset} ${FIREBASE_DB_URL}`);
+  console.log(`${C.dim}Polling:${C.reset}  ${POLL_INTERVALS.movingMs / 1000}s / ${POLL_INTERVALS.stationaryMs / 1000}s / ${POLL_INTERVALS.idleMs / 1000}s (moving/parked/idle)\n`);
 
-  // Initial login
+  // Load config with generous retry
   try {
-    await ensureSession();
+    await withRetry(() => loadConfig(), "Initial config load", 10);
   } catch (err) {
-    console.error(`${C.red}Failed to login: ${err.message}${C.reset}`);
+    console.error(`${C.red}Config load failed: ${err.message}${C.reset}`);
     console.log(`${C.yellow}Will retry on next poll cycle...${C.reset}\n`);
   }
 
-  // First poll
+  // Initial login
+  if (state.config?.enabled) {
+    try {
+      await ensureSession();
+    } catch (err) {
+      console.error(`${C.red}Login failed: ${err.message}${C.reset}`);
+      console.log(`${C.yellow}Will retry on next poll cycle...${C.reset}\n`);
+    }
+  }
+
   console.log(`${C.green}Starting polling loop...${C.reset}\n`);
   await pollOnce();
 
-  // Switch to dashboard mode after first poll
   dashboardMode = true;
   renderDashboard();
 
-  // Main loop
   while (true) {
     const interval = getNextInterval();
     await sleep(interval);
@@ -749,90 +793,88 @@ async function main() {
   }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // ─── Graceful Shutdown ───────────────────────────────────────────────
 
 process.on("SIGINT", async () => {
   dashboardMode = false;
-  console.log(`\n\n${C.yellow}🛑 Shutting down gracefully...${C.reset}`);
+  console.log(`\n\n${C.yellow}🛑 Shutting down...${C.reset}`);
 
-  // Write offline status to Firebase
-  try {
-    const deviceKey = `tracker-${CONFIG.dagps.imei}`;
-    const offlineData = {
-      rider_id: CONFIG.rider.id,
-      rider_name: CONFIG.rider.name,
-      lat: state.lastLocation?.lat || 0,
-      lng: state.lastLocation?.lng || 0,
-      accuracy: 5,
-      speed: null,
-      heading: null,
-      timestamp: new Date().toISOString(),
-      shift_id: `tracker-${CONFIG.dagps.imei}`,
-      status: "idle",
-      source: "tracker",
-      tracker_data: {
-        gps_time: state.lastLocation?.gps_time || "",
-        heart_time: state.lastLocation?.heart_time || "",
-        speed_kmh: 0,
-        alarm: 0,
-        signal: 0,
-        device_type: state.lastLocation?.device_type || "GT06",
-        imei: CONFIG.dagps.imei,
-        online: false,
-        movement: "idle",
-        heading_computed: 0,
-        heading_compass: "—",
-        heartbeat_age_sec: 999,
-        speed_history: state.speedHistory,
-        trail: state.trail,
-        poll_count: state.stats.totalPolls,
-        daemon_uptime_sec: Math.round((Date.now() - state.stats.startTime) / 1000),
-      },
-    };
-
-    await firebaseWriteLocation(offlineData);
-    console.log(`${C.green}✅ Offline status written to Firebase${C.reset}`);
-  } catch (err) {
-    console.log(`${C.red}Failed to write offline status: ${err.message}${C.reset}`);
+  const devices = state.config ? getEnabledDevices(state.config) : [];
+  for (const device of devices) {
+    const ds = getDeviceState(device.id);
+    try {
+      await firebaseWrite(`rider_locations/${device.id}`, {
+        rider_id: device.rider_id || device.id,
+        rider_name: device.rider_name || device.name || `Tracker ${device.imei}`,
+        lat: ds.lastLocation?.lat || 0,
+        lng: ds.lastLocation?.lng || 0,
+        accuracy: 5,
+        speed: null,
+        heading: null,
+        timestamp: new Date().toISOString(),
+        shift_id: device.id,
+        status: "idle",
+        source: "tracker",
+        tracker_data: {
+          gps_time: ds.lastLocation?.gps_time || "",
+          heart_time: ds.lastLocation?.heart_time || "",
+          speed_kmh: 0,
+          alarm: 0,
+          signal: 0,
+          device_type: ds.lastLocation?.device_type || "GT06",
+          imei: device.imei,
+          online: false,
+          movement: "idle",
+          heading_computed: 0,
+          heading_compass: "—",
+          heartbeat_age_sec: 999,
+          speed_history: ds.speedHistory,
+          trail: ds.trail,
+          poll_count: state.stats.totalPolls,
+          daemon_uptime_sec: Math.round((Date.now() - state.stats.startTime) / 1000),
+        },
+      });
+      console.log(`${C.green}✅ ${device.name || device.id}: offline${C.reset}`);
+    } catch (err) {
+      console.log(`${C.red}✗ ${device.id}: ${err.message}${C.reset}`);
+    }
   }
 
-  // Print final stats
-  const uptime = formatDuration(Date.now() - state.stats.startTime);
-  console.log(`\n${C.bold}Final Stats:${C.reset}`);
-  console.log(`  Uptime:         ${uptime}`);
-  console.log(`  Total polls:    ${state.stats.totalPolls}`);
-  console.log(`  Successful:     ${state.stats.successPolls}`);
-  console.log(`  Errors:         ${state.stats.errorPolls}`);
-  console.log(`  Firebase writes: ${state.stats.firebaseWrites}`);
-  console.log(`  Trail points:   ${state.trail.length}`);
-  console.log(`\n${C.dim}Goodbye! 👋${C.reset}\n`);
-
+  const uptime = formatDuration(Math.round((Date.now() - state.stats.startTime) / 1000));
+  console.log(`\n${C.bold}Stats:${C.reset} ${uptime} uptime, ${state.stats.totalPolls} polls, ${state.stats.successPolls} OK, ${state.stats.errorPolls} errors, ${state.stats.firebaseWrites} writes`);
+  console.log(`${C.dim}Goodbye! 👋${C.reset}\n`);
   process.exit(0);
 });
 
-// ─── Health Check Server (for cloud platforms) ──────────────────────
+// ─── Health Check Server ─────────────────────────────────────────────
 
 function startHealthServer() {
   const PORT = process.env.PORT || 8080;
   const server = http.createServer((req, res) => {
     if (req.url === "/health" || req.url === "/") {
-      const uptime = formatDuration(Date.now() - state.stats.startTime);
+      const uptime = formatDuration(Math.round((Date.now() - state.stats.startTime) / 1000));
+      const devices = state.config ? getEnabledDevices(state.config) : [];
+
       const payload = {
         status: "ok",
-        daemon: "montbile-tracker-v2",
+        daemon: "montbile-tracker-v3",
         uptime,
-        online: state.online,
-        movement: state.movement,
+        enabled: state.config?.enabled || false,
+        devices_enabled: devices.length,
+        devices_online: devices.filter((d) => getDeviceState(d.id).online).length,
+        devices: devices.map((d) => {
+          const ds = getDeviceState(d.id);
+          return {
+            id: d.id, name: d.name, imei: d.imei, online: ds.online,
+            movement: ds.movement, speed: ds.lastLocation?.speed_kmh || 0,
+            lat: ds.lastLocation?.lat || null, lng: ds.lastLocation?.lng || null,
+          };
+        }),
         polls: state.stats.totalPolls,
         errors: state.stats.errorPolls,
         firebase_writes: state.stats.firebaseWrites,
-        last_poll: state.stats.lastPollTime ? state.stats.lastPollTime.toISOString() : null,
-        last_lat: state.lastLocation?.lat || null,
-        last_lng: state.lastLocation?.lng || null,
+        last_poll: state.stats.lastPollTime?.toISOString() || null,
+        consecutive_errors: state.stats.consecutiveErrors,
       };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(payload));
@@ -841,14 +883,13 @@ function startHealthServer() {
       res.end("Not found");
     }
   });
-  server.listen(PORT, () => {
-    log("🌐", `Health server listening on port ${PORT}`);
-  });
+  server.listen(PORT, () => log("🌐", `Health server on port ${PORT}`));
 }
 
 // ─── Start ───────────────────────────────────────────────────────────
 startHealthServer();
 main().catch((err) => {
-  console.error(`${C.red}Fatal error: ${err.message}${C.reset}`);
-  process.exit(1);
+  console.error(`${C.red}Fatal: ${err.message}${C.reset}`);
+  log("🔄", "Restarting in 30s...");
+  sleep(30000).then(() => main().catch(() => process.exit(1)));
 });

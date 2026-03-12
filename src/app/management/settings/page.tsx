@@ -873,6 +873,13 @@ function TrackerTab({
     } catch { toast.error("Failed to remove"); }
   };
 
+  const handleToggleDevice = async (device: typeof deviceList[0]) => {
+    try {
+      await addTrackerDevice(device.id, { ...device, id: undefined, enabled: !device.enabled } as unknown as TrackerDevice);
+      toast.success(device.enabled ? "Device disabled" : "Device enabled");
+    } catch { toast.error("Failed to update"); }
+  };
+
   return (
     <div className="space-y-4 animate-fade-in">
       {/* Status Banner */}
@@ -1007,7 +1014,12 @@ function TrackerTab({
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <div className={`flex h-2.5 w-2.5 rounded-full ${device.enabled ? "bg-emerald-500" : "bg-gray-400"}`} />
+                      <button
+                        onClick={() => handleToggleDevice(device)}
+                        className={`relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors ${device.enabled !== false ? 'bg-emerald-500' : 'bg-gray-300 dark:bg-surface-600'}`}
+                      >
+                        <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform mt-0.5 ${device.enabled !== false ? 'translate-x-4 ml-0.5' : 'translate-x-0.5'}`} />
+                      </button>
                       <button onClick={() => handleRemoveDevice(device.id)}
                         className="p-1.5 text-gray-300 hover:text-red-500 transition-colors rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20">
                         <Trash2 className="h-4 w-4" />
@@ -1030,7 +1042,7 @@ function TrackerTab({
               { step: "1", text: "Enter your device IMEI and password (default: 123456) above" },
               { step: "2", text: "Add your tracker device using its IMEI number (on the device sticker)" },
               { step: "3", text: "Assign the device to a rider so it shows on the fleet map" },
-              { step: "4", text: "The Cloud Function polls DAGPS every 30s and updates the map" },
+              { step: "4", text: "The tracker daemon polls DAGPS every 10-30s and updates the map in real-time" },
             ].map((item) => (
               <div key={item.step} className="flex items-start gap-2">
                 <span className="flex h-5 w-5 items-center justify-center rounded-full bg-bolt text-[10px] font-black text-white shrink-0">{item.step}</span>
