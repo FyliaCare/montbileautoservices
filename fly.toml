@@ -3,7 +3,7 @@ app = 'montbileautoservices'
 primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile.tracker"
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 8080
