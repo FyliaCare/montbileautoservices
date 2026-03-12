@@ -151,8 +151,10 @@ function LiveMapTab({ riderLocations }: { riderLocations: Record<string, RiderLo
     l.source === "tracker" ? l.tracker_data?.online : l.status === "active"
   );
   const speeds = liveEntries
-    .filter(([, l]) => l.speed != null)
-    .map(([, l]) => Math.round((l.speed || 0) * 3.6));
+    .map(([, l]) => l.source === "tracker" && l.tracker_data?.speed_kmh != null
+      ? Math.round(l.tracker_data.speed_kmh)
+      : (l.speed != null ? Math.round(l.speed * 3.6) : 0)
+    );
   const movingCount = speeds.filter((s) => s > 2).length;
   const parkedCount = liveEntries.length - movingCount;
   const avgSpeed = speeds.length > 0 ? Math.round(speeds.reduce((a, b) => a + b, 0) / speeds.length) : 0;
