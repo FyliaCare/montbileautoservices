@@ -1,4 +1,4 @@
-const CACHE_NAME = "montbile-v4";
+const CACHE_NAME = "montbile-v5";
 const STATIC_ASSETS = [
   "/",
   "/login/",
@@ -37,7 +37,7 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-// Fetch — stale-while-revalidate for pages, cache-first for assets
+// Fetch — network-first for hashed assets, stale-while-revalidate for pages
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   const url = new URL(request.url);
@@ -46,8 +46,25 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
   if (url.origin !== self.location.origin) return;
 
-  // JS/CSS/images — cache-first
-  if (/\.(js|css|png|jpg|svg|ico|woff2?)$/.test(url.pathname)) {
+  // Hashed JS/CSS chunks (_next/static) — network-first, fallback to cache
+  // These change every build so we must always try the network first
+  if (url.pathname.startsWith("/_next/static/")) {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((c) => c.put(request, clone));
+          }
+          return response;
+        })
+        .catch(() => caches.match(request).then((cached) => cached || new Response("Offline", { status: 503 })))
+    );
+    return;
+  }
+
+  // Other static assets (icons, images) — cache-first
+  if (/\.(png|jpg|svg|ico|woff2?)$/.test(url.pathname)) {
     event.respondWith(
       caches.match(request).then(
         (cached) =>
