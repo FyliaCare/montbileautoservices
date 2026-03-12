@@ -327,30 +327,29 @@ async function dagpsLogin(account, password) {
 
 async function dagpsFetchLocation(session) {
   const serverUrl = state.config?.server_url || DAGPS_BASE_URL;
+  const baseHeaders = {
+    Cookie: session.cookie,
+    Referer: `${serverUrl}/user/indexp.aspx?mds=${session.mds}`,
+  };
 
-  let url = `${serverUrl}/GetDataService.aspx?method=loadUser&mds=${session.mds}&callback=cb`;
-  if (session.user_id) {
-    url += `&user_id=${encodeURIComponent(session.user_id)}`;
-  }
-
-  const res = await httpRequest(url, {
-    headers: {
-      Cookie: session.cookie,
-      Referer: `${serverUrl}/user/indexp.aspx?mds=${session.mds}`,
-    },
-    timeout: 10000,
-  });
-
+  // loadUser — the only working DAGPS endpoint.
+  // Returns device coords, heartbeat, but speed/signal always 0 on GT06.
+  // Speed is computed from consecutive GPS positions in analyzeMovement().
+  const url = `${serverUrl}/GetDataService.aspx?method=loadUser&mds=${session.mds}&user_id=${encodeURIComponent(session.user_id)}&callback=cb`;
+  const res = await httpRequest(url, { headers: baseHeaders, timeout: 10000 });
   if (res.status !== 200) return [];
 
   const jsonStr = res.body.replace(/^cb\(/, "").replace(/\);?\s*$/, "");
   const json = JSON.parse(jsonStr);
   if (json.success !== "true" || !json.data) return [];
 
+  state.lastRawDagps = json.data;
+
   return json.data.map((d) => ({
     lat: parseFloat(d.weidu) || 0,
     lng: parseFloat(d.jingdu) || 0,
     speed_kmh: parseFloat(d.sudu) || 0,
+    heading_raw: 0,
     gps_time: d.datetime || "",
     heart_time: d.heart_time || "",
     sys_time: d.sys_time || "",
@@ -465,9 +464,9 @@ function analyzeMovement(deviceId, loc) {
     }
   }
 
-  // ── Heading from consecutive moved points ──
-  let heading = 0;
-  if (ds.prevLatLng && loc.lat !== 0 && loc.lng !== 0) {
+  // ── Heading from API or consecutive moved points ──
+  let heading = loc.heading_raw > 0 ? Math.round(loc.heading_raw) : 0;
+  if (!heading && ds.prevLatLng && loc.lat !== 0 && loc.lng !== 0) {
     const [prevLat, prevLng] = ds.prevLatLng;
     if (distanceMeters(prevLat, prevLng, loc.lat, loc.lng) > 5) {
       heading = Math.round(computeBearing(prevLat, prevLng, loc.lat, loc.lng));
@@ -918,6 +917,18 @@ function startHealthServer() {
       };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(payload));
+    } else if (pathname === "/debug") {
+      const devices = state.config ? getEnabledDevices(state.config) : [];
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        raw_dagps: state.lastRawDagps || null,
+        devices: devices.map(d => {
+          const ds = getDeviceState(d.id);
+          return { id: d.id, computedSpeed: ds.computedSpeed, movement: ds.movement,
+            trailLength: ds.trail?.length || 0, speedHistory: ds.speedHistory };
+        }),
+        polls: state.stats.totalPolls,
+      }));
     } else {
       res.writeHead(404);
       res.end("Not found");

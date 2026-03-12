@@ -617,81 +617,14 @@ export default function RiderDashboard() {
         const trackerEntries = Object.entries(riderLocations).filter(([, l]) => l.source === "tracker");
         if (trackerEntries.length === 0) return null;
         const [trackerId, tracker] = trackerEntries[0];
-        const td = tracker.tracker_data;
-        const speed = td?.speed_kmh ?? 0;
-        const isMoving = speed > 2;
-        const hbAge = td?.heartbeat_age_sec;
-        const hbOk = hbAge != null && hbAge < 120;
         return (
           <div className="animate-fade-in space-y-3">
             <SectionHeader title="Live Vehicle Tracker" />
-            {/* Tracker status bar */}
-            <div className={`rounded-2xl border p-3 ${td?.online ? "bg-gradient-to-br from-indigo-500/10 to-purple-500/5 border-indigo-500/20" : "bg-gray-50 dark:bg-surface-700 border-gray-200 dark:border-surface-600"}`}>
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-2">
-                  <Satellite className={`h-4 w-4 ${td?.online ? "text-indigo-500" : "text-gray-400"}`} />
-                  <span className="text-xs font-bold text-gray-700 dark:text-gray-200">{tracker.rider_name}</span>
-                  <span className="text-[9px] text-gray-400">📡 Hardware Tracker</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full ${td?.online ? (isMoving ? "bg-emerald-400 animate-pulse" : "bg-blue-400") : "bg-gray-400"}`} />
-                  <span className={`text-[10px] font-bold ${td?.online ? (isMoving ? "text-emerald-500" : "text-blue-500") : "text-gray-400"}`}>
-                    {td?.online ? (isMoving ? "MOVING" : "PARKED") : "OFFLINE"}
-                  </span>
-                </div>
-              </div>
-              {/* Quick stats row */}
-              <div className="grid grid-cols-4 gap-2">
-                <div className="rounded-xl bg-white/60 dark:bg-surface-800/60 p-2 text-center">
-                  <Gauge className={`h-3.5 w-3.5 mx-auto mb-0.5 ${isMoving ? "text-emerald-500" : "text-blue-400"}`} />
-                  <p className={`text-lg font-black leading-none ${isMoving ? "text-emerald-500" : "text-blue-400"}`}>{Math.round(speed)}</p>
-                  <p className="text-[8px] text-gray-400 mt-0.5">km/h</p>
-                </div>
-                <div className="rounded-xl bg-white/60 dark:bg-surface-800/60 p-2 text-center">
-                  <Navigation className="h-3.5 w-3.5 mx-auto mb-0.5 text-blue-400" style={{ transform: `rotate(${td?.heading_computed || 0}deg)` }} />
-                  <p className="text-sm font-bold text-blue-300 leading-none">{td?.heading_compass && td.heading_compass !== "—" ? td.heading_compass : "—"}</p>
-                  <p className="text-[8px] text-gray-400 mt-0.5">heading</p>
-                </div>
-                <div className="rounded-xl bg-white/60 dark:bg-surface-800/60 p-2 text-center">
-                  <Wifi className={`h-3.5 w-3.5 mx-auto mb-0.5 ${td?.online ? "text-indigo-400" : "text-gray-400"}`} />
-                  <p className={`text-sm font-bold leading-none ${td?.online ? "text-indigo-400" : "text-gray-400"}`}>{td?.online ? "ON" : "OFF"}</p>
-                  <p className="text-[8px] text-gray-400 mt-0.5">signal</p>
-                </div>
-                <div className="rounded-xl bg-white/60 dark:bg-surface-800/60 p-2 text-center">
-                  <span className="text-sm">❤️</span>
-                  <p className={`text-sm font-bold leading-none ${hbOk ? "text-emerald-400" : "text-gray-400"}`}>
-                    {hbAge != null ? (hbAge < 60 ? `${hbAge}s` : `${Math.floor(hbAge / 60)}m`) : "—"}
-                  </p>
-                  <p className="text-[8px] text-gray-400 mt-0.5">heartbeat</p>
-                </div>
-              </div>
-              {/* Mileage + movement */}
-              {td && (
-                <div className="flex items-center justify-between mt-2 text-[9px] text-gray-400">
-                  <span className={`font-semibold ${isMoving ? "text-emerald-400" : "text-blue-400"}`}>
-                    ⚡ {td.movement ? td.movement.toUpperCase() : "UNKNOWN"}
-                  </span>
-                  {td.trail && td.trail.length > 1 && (
-                    <span>🛣️ <span className="font-semibold text-gray-200">{(() => {
-                      let d = 0;
-                      for (let i = 1; i < td.trail.length; i++) {
-                        const R = 6371;
-                        const dLat = (td.trail[i].lat - td.trail[i-1].lat) * Math.PI / 180;
-                        const dLng = (td.trail[i].lng - td.trail[i-1].lng) * Math.PI / 180;
-                        const a = Math.sin(dLat/2)**2 + Math.cos(td.trail[i-1].lat*Math.PI/180)*Math.cos(td.trail[i].lat*Math.PI/180)*Math.sin(dLng/2)**2;
-                        d += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-                      }
-                      return d.toFixed(1);
-                    })()} km</span></span>
-                  )}
-                  <span className="text-gray-500">{tracker.lat.toFixed(5)}, {tracker.lng.toFixed(5)}</span>
-                </div>
-              )}
-            </div>
-            {/* Map showing tracker position */}
+            {/* HUD-style map with built-in instrument panel */}
             <RiderMap
               locations={{ [trackerId]: tracker }}
-              height="280px"
+              height="480px"
+              selectedRiderId={trackerId}
             />
           </div>
         );

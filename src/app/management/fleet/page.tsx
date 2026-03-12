@@ -287,7 +287,7 @@ function LiveMapTab({ riderLocations }: { riderLocations: Record<string, RiderLo
       {/* Map */}
       <RiderMap
         locations={riderLocations}
-        height="420px"
+        height="520px"
         selectedRiderId={selectedRider}
         onSelectRider={setSelectedRider}
       />
